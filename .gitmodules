@@ -1,0 +1,4 @@
+[submodule "third_party/winspd"]
+	path = third_party/winspd
+	url = https://github.com/edbordin/winspd.git
+	branch = shared-ring-v1

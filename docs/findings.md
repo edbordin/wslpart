@@ -1126,5 +1126,25 @@ partition has been opened.
   later request in that same WAIT. Userspace had not yet reclaimed the matching
   work item. The kernel now snapshots eligible free slots at WAIT entry and
   defers slots freed during that WAIT until the next WAIT. The ARM64 driver
-  builds and signs; runtime validation and a new ring measurement remain
-  pending driver installation and rerun.
+  builds and signs; the signed package is installed and selected for
+  `ROOT\SCSIADAPTER\0000` as `oem22.inf`. After reboot and re-enumeration, the
+  WinSpd service is running and the installed SYS hash matches the build.
+
+### 2026-10-03 — SharedRing V2 ring tests after driver install
+
+- The first full test attempt passed lifecycle, wraparound, asynchronous
+  response, and saturation, then stalled during the wait-credit test's disk
+  discovery. The manual test path synchronously queried PhysicalDrive
+  properties while it was also the only consumer of ring requests. This could
+  block discovery and made later `RING_WAIT` failures misleading.
+- Manual discovery now polls SetupAPI for the disk interface and avoids
+  synchronous storage queries while manually consuming the ring. The test also
+  reports a `RING_WAIT` Win32 error and tears down pending test I/O instead of
+  continuing an unbounded loop. All five ring integration tests then passed:
+  lifecycle, wraparound, asynchronous response, saturation, and wait credit.
+- The clean suite passes, but the post-install QD32 SharedRing rerun still
+  fails during the 256-MiB test-file preparation, before timed fio begins. It
+  reports a token collision at request sequence 1312, slot 25. The prior
+  `WaitAvailable` snapshot therefore does not fully prevent slot reuse. The
+  mounted test partition is being detached; no ring performance result is
+  available yet. The legacy numbers above remain single-run references.

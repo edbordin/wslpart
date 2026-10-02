@@ -11,8 +11,7 @@ try {
         -ProxySyncPolicy guest -ProxyBuffering none `
         -ProxyDispatcherThreads 8 -ProxyIOMode overlapped `
         -ProxyTransport shared-ring -RingDepth 64 `
-        -MaxTransferLength 262144 -RingCompletionBatch 32 `
-        -RingCompletionWaitMicroseconds 0 *>&1 |
+        -MaxTransferLength 262144 *>&1 |
         Tee-Object -FilePath $logPath -Append
     if (-not $?) { throw 'QD32 benchmark failed.' }
     '===== DONE matched-fastest-qd32 =====' |
@@ -25,8 +24,7 @@ try {
         -ProxySyncPolicy guest -ProxyBuffering none `
         -ProxyDispatcherThreads 8 -ProxyIOMode overlapped `
         -ProxyTransport shared-ring -RingDepth 256 `
-        -MaxTransferLength 262144 -RingCompletionBatch 32 `
-        -RingCompletionWaitMicroseconds 0 *>&1 |
+        -MaxTransferLength 262144 *>&1 |
         Tee-Object -FilePath $logPath -Append
     if (-not $?) { throw 'QD128 benchmark failed.' }
     '===== DONE matched-fastest-qd128 =====' |

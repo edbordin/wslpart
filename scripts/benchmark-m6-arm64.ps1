@@ -27,10 +27,6 @@ param(
     [int]$RingDepth = 64,
     [ValidateRange(4096, 1048576)]
     [int]$MaxTransferLength = 1048576,
-    [ValidateRange(0, 256)]
-    [int]$RingCompletionBatch = 0,
-    [ValidateRange(0, 1000000)]
-    [int]$RingCompletionWaitMicroseconds = 0,
     [ValidateSet('sync', 'overlapped')]
     [string]$ProxyIOMode = 'sync',
     [ValidateSet('legacy', 'shared-ring')]
@@ -46,10 +42,6 @@ $ErrorActionPreference = 'Stop'
 
 if ('sync' -eq $IoEngine -and 1 -ne $QueueDepth) {
     throw 'fio ioengine=sync cannot exercise a queue depth greater than 1.'
-}
-if ('shared-ring' -eq $ProxyTransport -and
-    $RingCompletionBatch -gt $RingDepth) {
-    throw 'Ring completion batch cannot exceed the configured ring depth.'
 }
 if (0 -ne ($MaxTransferLength % 4096)) {
     throw 'MaxTransferLength must be a multiple of 4096 bytes.'
@@ -122,7 +114,6 @@ if (-not [string]::IsNullOrEmpty($RunTag)) {
 if ($ProxyTransport -eq 'shared-ring') {
     $reportPath = $reportPath -replace '\.json$', '-ring.json'
     $reportPath = $reportPath -replace '\.json$', "-ringdepth$RingDepth.json"
-    $reportPath = $reportPath -replace '\.json$', "-cb$RingCompletionBatch-cwus$RingCompletionWaitMicroseconds.json"
 }
 if ($SkipVhdxBaseline) {
     $reportPath = $reportPath -replace '\.json$', '-proxy-only.json'
@@ -381,10 +372,6 @@ try {
     if ($ProxyTransport -eq 'shared-ring') {
         $arguments += '--ring-depth'
         $arguments += [string]$RingDepth
-        $arguments += '--ring-completion-batch'
-        $arguments += [string]$RingCompletionBatch
-        $arguments += '--ring-completion-wait-us'
-        $arguments += [string]$RingCompletionWaitMicroseconds
     }
     if ($ProxyFuaUnlocked) { $arguments += '--fua-unlocked' }
     elseif ($ProxyFua) { $arguments += '--fua' }
@@ -437,7 +424,7 @@ try {
             -Pattern 'SharedRing batches submissions=' |
             Select-Object -Last 1
         if ($null -ne $batchLine -and $batchLine.Line -match
-            'submissions=(\d+) requests=(\d+) max=(\d+) completions=(\d+) responses=(\d+) max=(\d+) workers=(\d+) slots=(\d+) sq=(\d+) cq=(\d+) cbatch=(\d+) cwait_us=(\d+)') {
+            'submissions=(\d+) requests=(\d+) max=(\d+) completions=(\d+) responses=(\d+) max=(\d+) workers=(\d+) depth=(\d+) buffer_size=(\d+)') {
             $ringStats = [pscustomobject]@{
                 SubmissionBatches = [UInt64]$Matches[1]
                 SubmittedRequests = [UInt64]$Matches[2]
@@ -446,11 +433,8 @@ try {
                 CompletedResponses = [UInt64]$Matches[5]
                 MaxCompletionBatch = [UInt32]$Matches[6]
                 Workers = [UInt32]$Matches[7]
-                BufferSlots = [UInt32]$Matches[8]
-                SubmissionEntries = [UInt32]$Matches[9]
-                CompletionEntries = [UInt32]$Matches[10]
-                CompletionBatchLimit = [UInt32]$Matches[11]
-                CompletionWaitMicroseconds = [UInt32]$Matches[12]
+                QueueDepth = [UInt32]$Matches[8]
+                BufferSize = [UInt32]$Matches[9]
             }
         }
     }
@@ -482,8 +466,6 @@ try {
         RingBufferPoolBytes = if ($ProxyTransport -eq 'shared-ring') {
             [UInt64]$RingDepth * [UInt64]$MaxTransferLength
         } else { $null }
-        RingCompletionBatch = if ($ProxyTransport -eq 'shared-ring') { $RingCompletionBatch } else { $null }
-        RingCompletionWaitMicroseconds = if ($ProxyTransport -eq 'shared-ring') { $RingCompletionWaitMicroseconds } else { $null }
         RingStats = $ringStats
         ProxyFua = [bool]$ProxyFua
         ProxyFuaUnlocked = [bool]$ProxyFuaUnlocked

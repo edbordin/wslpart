@@ -1084,3 +1084,26 @@ partition has been opened.
 - All three event sidecars are under `artifacts/m6/` with prefix
   `retry-diagnostic-20261002-063002-r`. The final repeat's I/O histogram and
   rare slow-request log are in `artifacts/m6/proxy.events.log`.
+
+### 2026-10-02 — SharedRing V2 simplification
+
+- Removed configurable completion batch and wait controls. The completion
+  thread now drains the current Done list and issues one RingKick; requests
+  completed during that kick accumulate for the next pass. The earlier sweep
+  results above remain historical measurements, while the current transport
+  has no intentional completion delay.
+- Collapsed the open ABI to `QueueDepth` plus `BufferSize`; SQ, CQ, kernel
+  pending slots, shared buffers, and userspace work items use the same depth
+  and slot number. RingWait accepts a userspace `MaxRequests` credit and fills
+  no more requests than that credit, even when kernel slots become available
+  before userspace has reclaimed its items.
+- Userspace now tracks `FreeCount` and an explicit item-state enum. A slot
+  becomes free only after RingKick succeeds. SQ and CQ counters publish once
+  per batch. Kernel pending records retain each request's unique token so a
+  delayed response cannot match a later use of the same slot. Worker count is
+  capped at QueueDepth.
+- Corrected READ CAPACITY (16) alignment reporting for non-zero physical
+  offsets; a 512-byte offset in a 4096-byte physical block now reports LALBA
+  7. Added driver-backed tests for ring open/close and cancellation,
+  wraparound, synchronous and asynchronous responses, depth saturation,
+  per-slot token reuse, and WAIT credit limits.

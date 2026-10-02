@@ -1446,12 +1446,9 @@ static void print_usage(FILE *stream)
         L"      --io-mode sync|overlapped  partition I/O completion mode\n"
         L"      --transport legacy|shared-ring\n"
         L"                                  WinSpd request transport\n"
-        L"      --ring-depth N              SharedRing SQ/CQ/buffer slots\n"
+        L"      --ring-depth N              SharedRing request/buffer slots\n"
         L"                                  (default: 64; maximum: 255)\n"
         L"      --max-transfer-length N    max SCSI transfer (4K..1M, 4K aligned)\n"
-        L"      --ring-completion-batch N   max responses per RingKick\n"
-        L"      --ring-completion-wait-us N max wait to collect responses\n"
-        L"      --ring-completion-wait-ms N legacy millisecond alias\n"
         L"      --dispatcher-threads N     WinSpd userspace dispatcher count\n"
         L"                                  (default: 2)\n"
         L"      --shared-ring-test        test SharedRingV1 mapping only\n"
@@ -1510,8 +1507,6 @@ int wmain(int argc, wchar_t **argv)
     BOOL shared_ring_test = FALSE;
     UINT32 ring_depth = 64;
     UINT32 max_transfer_length = WSLPART_MAX_TRANSFER_LENGTH;
-    UINT32 ring_completion_batch = 0;
-    UINT32 ring_completion_wait_us = 0;
     UINT64 shared_ring_section_size = 0;
     BOOL debug_log_events_only = FALSE;
     BOOL io_stats_requested = FALSE;
@@ -1667,27 +1662,6 @@ int wmain(int argc, wchar_t **argv)
                 0 != (max_transfer_length & 4095))
                 usage();
         }
-        else if (0 == wcscmp(argv[i], L"--ring-completion-batch") &&
-            i + 1 < argc)
-        {
-            if (!parse_uint32(argv[++i], &ring_completion_batch))
-                usage();
-        }
-        else if (0 == wcscmp(argv[i], L"--ring-completion-wait-us") &&
-            i + 1 < argc)
-        {
-            if (!parse_uint32(argv[++i], &ring_completion_wait_us) ||
-                1000000 < ring_completion_wait_us)
-                usage();
-        }
-        else if (0 == wcscmp(argv[i], L"--ring-completion-wait-ms") &&
-            i + 1 < argc)
-        {
-            UINT32 wait_ms;
-            if (!parse_uint32(argv[++i], &wait_ms) || 1000 < wait_ms)
-                usage();
-            ring_completion_wait_us = wait_ms * 1000;
-        }
         else if (0 == wcscmp(argv[i], L"--shared-ring-test"))
             shared_ring_test = TRUE;
         else
@@ -1814,9 +1788,7 @@ int wmain(int argc, wchar_t **argv)
 
         memset(&ring_params, 0, sizeof ring_params);
         ring_params.Version = SPD_RING_VERSION_1;
-        ring_params.SubmissionCount = ring_depth;
-        ring_params.CompletionCount = ring_depth;
-        ring_params.BufferCount = ring_depth;
+        ring_params.QueueDepth = ring_depth;
         ring_params.BufferSize = max_transfer_length;
 
         error = SpdStorageUnitOpenSharedRing(storage_unit, &ring_params);
@@ -1831,9 +1803,7 @@ int wmain(int argc, wchar_t **argv)
         ring_header = storage_unit->SharedRingHeader;
         if (0 == ring_header ||
             SPD_RING_VERSION_1 != ring_header->Version ||
-            ring_params.SubmissionCount != ring_header->SubmissionCount ||
-            ring_params.CompletionCount != ring_header->CompletionCount ||
-            ring_params.BufferCount != ring_header->BufferCount ||
+            ring_params.QueueDepth != ring_header->QueueDepth ||
             ring_params.BufferSize != ring_header->BufferSize)
         {
             fwprintf(stderr, L"SharedRingV1 header validation failed\n");
@@ -1844,28 +1814,15 @@ int wmain(int argc, wchar_t **argv)
         }
         shared_ring_section_size = ring_params.SectionSize;
 
-        error = SpdStorageUnitSetSharedRingCompletionBatch(storage_unit,
-            ring_completion_batch, ring_completion_wait_us);
-        if (ERROR_SUCCESS != error)
-        {
-            print_win32_error(L"configure SharedRing completion batching",
-                error);
-            SpdStorageUnitDelete(storage_unit);
-            close_source(&source);
-            return 1;
-        }
-
         if (shared_ring_test)
         {
             ring_header->UserHeartbeat = 1;
             fwprintf(stdout,
                 L"SharedRingV1 mapping OK: address=0x%llx size=%llu "
-                L"SQ=%lu CQ=%lu buffers=%lu buffer_size=%lu\n",
+                L"depth=%lu buffer_size=%lu\n",
                 (unsigned long long)ring_params.UserAddress,
                 (unsigned long long)ring_params.SectionSize,
-                (unsigned long)ring_header->SubmissionCount,
-                (unsigned long)ring_header->CompletionCount,
-                (unsigned long)ring_header->BufferCount,
+                (unsigned long)ring_header->QueueDepth,
                 (unsigned long)ring_header->BufferSize);
             SpdStorageUnitCloseSharedRing(storage_unit);
             SpdStorageUnitDelete(storage_unit);

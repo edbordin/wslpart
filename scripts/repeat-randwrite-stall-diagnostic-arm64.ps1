@@ -39,8 +39,6 @@ for ($repeat = 1; $repeat -le $Repeats; $repeat++) {
         -ProxyDispatcherThreads 8 `
         -RingDepth 64 `
         -MaxTransferLength 1048576 `
-        -RingCompletionBatch 32 `
-        -RingCompletionWaitMicroseconds 0 `
         -ProxyIOMode overlapped `
         -ProxyTransport shared-ring `
         -Workloads randwrite4k `

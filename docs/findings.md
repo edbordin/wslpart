@@ -1167,3 +1167,11 @@ partition has been opened.
   wraparound, async response, saturation, and WAIT credit. The older full
   WinSpd suite still encounters its known adapter pass-through failure at
   `ioctl_transact_read_test`; ring-specific tests were run separately.
+- Rebuilt the ARM64 WslPart proxy against the enlarged WAIT ABI and reran the
+  matched QD32 test on the same ext4 partition after reboot. Both 20-second
+  fio workloads completed at average QD 32.03 with no slot collision or
+  dispatcher error. SharedRing recorded 6,026,165 submissions and the same
+  number of completed responses. Random read measured 136,638 IOPS and
+  232.2 us mean latency; random write measured 164,571 IOPS and 192.09 us mean
+  latency. These remain single-run results; the earlier legacy references
+  were 97,451 random-read IOPS and 135,760 random-write IOPS.

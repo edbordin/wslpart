@@ -1,0 +1,14 @@
+# Build and experiment output
+artifacts/
+build/
+*.rawdisk
+*.vhd
+
+# Local IDE state
+.vs/
+CMakeUserPresets.json
+
+# Stray files from the local Windows build/test environment.
+/%SystemDrive%/
+/query
+/start

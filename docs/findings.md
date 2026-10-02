@@ -1148,3 +1148,22 @@ partition has been opened.
   `WaitAvailable` snapshot therefore does not fully prevent slot reuse. The
   mounted test partition is being detached; no ring performance result is
   available yet. The legacy numbers above remain single-run references.
+
+### 2026-10-03 — SharedRing V2 exact-slot WAIT credits
+
+- Fixed the remaining identity race by extending `RING_WAIT` with a bitmap of
+  the exact userspace-free slots. The dispatcher snapshots item states while
+  holding its runtime lock and sends that bitmap with `MaxRequests`. The
+  kernel validates the bitmap and snapshots only those identities as eligible
+  for that WAIT; a slot freed by KICK cannot be substituted unless userspace
+  included that slot in its next WAIT bitmap.
+- Updated the manual WAIT callers. The wait-credit integration test now offers
+  only slot 3, exercising a sparse identity rather than only checking a count.
+- The x64 WinSpd test binary and ARM64 driver compile successfully. The ARM64
+  driver package was signed, installed as `oem33.inf` version `1.0.26278.0`,
+  and activated after reboot; the installed SYS SHA-256 matches the build:
+  `48C74589C92327FF6F4CBDA54DB94EF4EFBCAD8B756A6579F4344C22DE10F857`.
+- All five ring integration tests pass against that driver: lifecycle,
+  wraparound, async response, saturation, and WAIT credit. The older full
+  WinSpd suite still encounters its known adapter pass-through failure at
+  `ioctl_transact_read_test`; ring-specific tests were run separately.

@@ -1107,3 +1107,24 @@ partition has been opened.
   7. Added driver-backed tests for ring open/close and cancellation,
   wraparound, synchronous and asynchronous responses, depth saturation,
   per-slot token reuse, and WAIT credit limits.
+
+### 2026-10-03 — SharedRing V2 QD32 benchmark exposed slot reuse race
+
+- A matched direct-I/O QD32 run used fio 3.41 `io_uring`, a 256-MiB file,
+  guest flush policy, unbuffered overlapped source I/O, eight dispatchers,
+  262144-byte transfers, and SharedRing depth 64. The legacy pass completed:
+  97,451 random-read IOPS (326 us mean completion latency) and 135,760
+  random-write IOPS (233 us mean latency). These are single-run measurements.
+- The SharedRing pass stopped during test-file preparation before timed fio
+  measurements. The proxy reported `SharedRing request token slot already in
+  use` at request sequence 1720, slot 4, then stopped with error 13. The
+  benchmark's blocked fio could not be canceled normally after the proxy
+  stopped; the Ubuntu test distro was terminated to release the mounted test
+  partition. No ring performance result is available from this pass.
+- The cause was a concurrent WAIT/KICK slot-reuse race. WAIT could begin with
+  free slots, block for its first request, then use a slot freed by KICK for a
+  later request in that same WAIT. Userspace had not yet reclaimed the matching
+  work item. The kernel now snapshots eligible free slots at WAIT entry and
+  defers slots freed during that WAIT until the next WAIT. The ARM64 driver
+  builds and signs; runtime validation and a new ring measurement remain
+  pending driver installation and rerun.

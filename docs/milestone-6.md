@@ -120,20 +120,17 @@ The unsafe dual-handle experiment can be selected separately:
 This intentionally omits `FSCTL_LOCK_VOLUME` and is only appropriate for the
 known Windows-unused ext4 test partition.
 
-## Experimental SharedRingV1 transport
+## Historical SharedRing benchmark results
 
-WinSpd now contains an experimental driver-owned shared-memory transport
-under the existing transaction and storage callback APIs. The initial path
-has a fixed aligned submission/completion ring and buffer pool, batched
-`WAIT`/`KICK` doorbells, and reuses `SPD_IOCTL_TRANSACT_REQ`,
-`SPD_IOCTL_TRANSACT_RSP`, and the existing `SPD_STORAGE_UNIT_INTERFACE`.
-Select it with `--transport shared-ring`.
+The measurements below came from the earlier SharedRing implementation and do
+not establish Shared Ring V3 performance. V3 keeps the canonical transaction
+structures and callback API while replacing slot identity with independent
+request/completion cursors, fixed shared buffers, and userspace work items.
 
-Runtime validation requires installing the matching rebuilt ARM64 driver. The
-ring dispatcher uses a fixed userspace worker pool and batches completions.
-In ring mode WslPart now associates the source handles with an IOCP and submits
-partition reads and writes directly from/to the shared slots; legacy transport
-keeps its existing per-operation completion path.
+The V3 transport is selected with `--transport shared-ring`. The ARM64 driver
+and DLL and the x64 ring integration-test executable compile, and the
+translation tests pass. Current V3 driver-backed integration and performance
+validation still require an elevated session and have not been run.
 
 The matched direct-I/O suite's partition random-write value (9.68 IOPS) was an
 isolated pathological outlier, not a valid steady-state comparison. Targeted

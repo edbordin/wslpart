@@ -1446,12 +1446,12 @@ static void print_usage(FILE *stream)
         L"      --io-mode sync|overlapped  partition I/O completion mode\n"
         L"      --transport legacy|shared-ring\n"
         L"                                  WinSpd request transport\n"
-        L"      --ring-depth N              SharedRing request/buffer slots\n"
-        L"                                  (default: 64; maximum: 255)\n"
+        L"      --ring-depth N              SharedRing V3 queue and buffer count\n"
+        L"                                  (default: 64; power of two, 2..4096)\n"
         L"      --max-transfer-length N    max SCSI transfer (4K..1M, 4K aligned)\n"
         L"      --dispatcher-threads N     WinSpd userspace dispatcher count\n"
         L"                                  (default: 2)\n"
-        L"      --shared-ring-test        test SharedRingV1 mapping only\n"
+        L"      --shared-ring-test        test SharedRing V3 mapping only\n"
         L"  -o Sector       verify the source partition start\n"
         L"  --shutdown-event Name  named event for graceful shutdown\n"
         L"  -D Path         append WinSpd/backend diagnostics to a file\n"
@@ -1650,7 +1650,9 @@ int wmain(int argc, wchar_t **argv)
         else if (0 == wcscmp(argv[i], L"--ring-depth") && i + 1 < argc)
         {
             if (!parse_uint32(argv[++i], &ring_depth) ||
-                0 == ring_depth || 256 < ring_depth)
+                ring_depth < SPD_RING_MIN_QUEUE_DEPTH ||
+                ring_depth > SPD_RING_MAX_QUEUE_DEPTH ||
+                0 != (ring_depth & (ring_depth - 1)))
                 usage();
         }
         else if (0 == wcscmp(argv[i], L"--max-transfer-length") &&
@@ -1787,14 +1789,14 @@ int wmain(int argc, wchar_t **argv)
         SPD_RING_HEADER *ring_header;
 
         memset(&ring_params, 0, sizeof ring_params);
-        ring_params.Version = SPD_RING_VERSION_1;
+        ring_params.Version = SPD_RING_VERSION_3;
         ring_params.QueueDepth = ring_depth;
         ring_params.BufferSize = max_transfer_length;
 
         error = SpdStorageUnitOpenSharedRing(storage_unit, &ring_params);
         if (ERROR_SUCCESS != error)
         {
-            print_win32_error(L"open SharedRingV1 mapping", error);
+            print_win32_error(L"open SharedRing V3 mapping", error);
             SpdStorageUnitDelete(storage_unit);
             close_source(&source);
             return 1;
@@ -1802,11 +1804,12 @@ int wmain(int argc, wchar_t **argv)
 
         ring_header = storage_unit->SharedRingHeader;
         if (0 == ring_header ||
-            SPD_RING_VERSION_1 != ring_header->Version ||
+            SPD_RING_VERSION_3 != ring_header->Version ||
             ring_params.QueueDepth != ring_header->QueueDepth ||
+            ring_params.QueueDepth != ring_header->BufferCount ||
             ring_params.BufferSize != ring_header->BufferSize)
         {
-            fwprintf(stderr, L"SharedRingV1 header validation failed\n");
+            fwprintf(stderr, L"SharedRing V3 header validation failed\n");
             SpdStorageUnitCloseSharedRing(storage_unit);
             SpdStorageUnitDelete(storage_unit);
             close_source(&source);
@@ -1816,13 +1819,13 @@ int wmain(int argc, wchar_t **argv)
 
         if (shared_ring_test)
         {
-            ring_header->UserHeartbeat = 1;
             fwprintf(stdout,
-                L"SharedRingV1 mapping OK: address=0x%llx size=%llu "
-                L"depth=%lu buffer_size=%lu\n",
+                L"SharedRing V3 mapping OK: address=0x%llx size=%llu "
+                L"depth=%lu buffers=%lu buffer_size=%lu\n",
                 (unsigned long long)ring_params.UserAddress,
                 (unsigned long long)ring_params.SectionSize,
                 (unsigned long)ring_header->QueueDepth,
+                (unsigned long)ring_header->BufferCount,
                 (unsigned long)ring_header->BufferSize);
             SpdStorageUnitCloseSharedRing(storage_unit);
             SpdStorageUnitDelete(storage_unit);
@@ -1914,10 +1917,10 @@ int wmain(int argc, wchar_t **argv)
         WSLPART_BUFFERED == buffering ? L"cached" : L"none",
         WSLPART_IO_OVERLAPPED == io_mode ? L"overlapped" : L"sync",
         source.fua_supported ? L"enabled" : L"disabled",
-        shared_ring_requested ? L"SharedRingV1" : L"legacy",
+        shared_ring_requested ? L"SharedRingV3" : L"legacy",
         (unsigned long)dispatcher_thread_count);
     if (shared_ring_requested || shared_ring_test)
-        wprintf(L"SharedRing pinned section: %llu MiB; data pool: %llu MiB (%lu slots x %lu bytes)\n",
+        wprintf(L"SharedRing pinned section: %llu MiB; data pool: %llu MiB (%lu buffers x %lu bytes)\n",
             (unsigned long long)(shared_ring_section_size / (1024 * 1024)),
             (unsigned long long)(((UINT64)ring_depth * max_transfer_length) /
                 (1024 * 1024)),

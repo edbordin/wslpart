@@ -22,8 +22,10 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 $benchmark = Join-Path $PSScriptRoot 'benchmark-m6-arm64.ps1'
 $ringValues = @($RingDepths -split '[,;]' |
     ForEach-Object { [int]::Parse($_) })
-if (@($ringValues | Where-Object { $_ -lt 1 -or $_ -gt 256 }).Count -gt 0) {
-    throw 'Ring depths must be between 1 and 256.'
+if (@($ringValues | Where-Object {
+    $_ -lt 2 -or $_ -gt 4096 -or 0 -ne ($_ -band ($_ - 1))
+}).Count -gt 0) {
+    throw 'Ring depths must be powers of two from 2 through 4096.'
 }
 $transferValues = @($MaxTransferLengths -split '[,;]' |
     ForEach-Object { [int]::Parse($_) })

@@ -16,8 +16,8 @@ exclusive Windows volume ownership.
 
 ## Current status
 
-- WinSpd is a pinned submodule under `third_party/winspd`, tracking the
-  `shared-ring-v1` branch of the WslPart fork.
+- WinSpd is a pinned submodule under `third_party/winspd`; its current review
+  working tree contains the Shared Ring V3 refactor.
 - The host has WSL2 and a native ARM64 C++/WDK build toolchain installed.
 - The WinSpd ARM64 Release driver, userspace DLL, rawdisk sample, and
   installation utility build successfully from source.
@@ -52,9 +52,9 @@ remains disabled.
 
 See [docs/milestone-6.md](docs/milestone-6.md) for the workloads and results.
 
-The experimental WinSpd `SharedRingV1` transport can be selected with
+The experimental WinSpd `SharedRingV3` transport can be selected with
 `--transport shared-ring`. Legacy per-request IOCTL transport remains the
-default while the ring path is being validated.
+default while V3 runtime validation is pending.
 
 The native build and translation tests can be repeated with:
 
@@ -100,11 +100,11 @@ Do not continue to the real-partition backend unless a new `/dev/sdX` appears.
   path for the current stock sample.
 - PowerShell 5+.
 
-WinSpd is forked at <https://github.com/edbordin/winspd>. The
-`shared-ring-v1` branch contains the experimental shared-memory transport and
-related ARM64 build changes for review. Its upstream license and attribution
-remain applicable to the submodule; WslPart's own code keeps its separate
-license and attribution boundaries explicit.
+WinSpd is forked at <https://github.com/edbordin/winspd>. The current WinSpd
+review working tree contains the experimental shared-memory transport and
+related ARM64 build changes. Its upstream license and attribution remain
+applicable to the submodule; WslPart's own code keeps its separate license and
+attribution boundaries explicit.
 
 The longer-term ARM64 driver-release goal remains an upstream pull request to
 WinSpd's signing pipeline. A replacement kernel driver remains out of scope

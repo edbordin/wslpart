@@ -8,6 +8,7 @@
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <stddef.h>
 
 static int failures;
 
@@ -28,37 +29,55 @@ static void expect_true(const char *name, int condition)
 
 static void test_ring_abi(void)
 {
-    const uint32_t submission_count = 64;
-    const uint32_t completion_count = 64;
+    const uint32_t queue_depth = 64;
     const uint32_t buffer_count = 64;
     const uint32_t buffer_size = 1024 * 1024;
-    uint64_t submission_offset;
+    uint64_t request_offset;
     uint64_t completion_offset;
     uint64_t buffer_offset;
     uint64_t section_size;
 
-    submission_offset = ring_align_up(sizeof(SPD_RING_HEADER), 64);
-    completion_offset = ring_align_up(submission_offset +
-        (uint64_t)submission_count * sizeof(SPD_RING_REQUEST), 64);
+    request_offset = ring_align_up(sizeof(SPD_RING_HEADER), 64);
+    completion_offset = ring_align_up(request_offset +
+        (uint64_t)queue_depth * sizeof(SPD_RING_REQUEST), 64);
     buffer_offset = ring_align_up(completion_offset +
-        (uint64_t)completion_count * sizeof(SPD_RING_COMPLETION), 4096);
+        (uint64_t)queue_depth * sizeof(SPD_RING_COMPLETION), 4096);
     section_size = ring_align_up(buffer_offset +
         (uint64_t)buffer_count * buffer_size, 4096);
 
     expect_true("ring ref has no payload", sizeof(SPD_RING_BUFFER_REF) == 16);
     expect_true("ring request is envelope only", sizeof(SPD_RING_REQUEST) ==
         sizeof(SPD_IOCTL_TRANSACT_REQ) + sizeof(SPD_RING_BUFFER_REF));
-    expect_true("ring completion preserves response", sizeof(SPD_RING_COMPLETION) ==
-        sizeof(SPD_IOCTL_TRANSACT_RSP));
-    expect_true("submission alignment", 0 == submission_offset % 64);
+    expect_true("ring completion envelopes response", sizeof(SPD_RING_COMPLETION) ==
+        sizeof(SPD_IOCTL_TRANSACT_RSP) + sizeof(SPD_RING_BUFFER_REF));
+    expect_true("cursor occupies cache line", sizeof(SPD_RING_CURSOR) == 64);
+    expect_true("request head cache line",
+        0 == offsetof(SPD_RING_HEADER, RequestHead) % 64);
+    expect_true("request tail cache line",
+        0 == offsetof(SPD_RING_HEADER, RequestTail) % 64);
+    expect_true("completion head cache line",
+        0 == offsetof(SPD_RING_HEADER, CompletionHead) % 64);
+    expect_true("completion tail cache line",
+        0 == offsetof(SPD_RING_HEADER, CompletionTail) % 64);
+    expect_true("request alignment", 0 == request_offset % 64);
     expect_true("completion alignment", 0 == completion_offset % 64);
     expect_true("buffer alignment", 0 == buffer_offset % 4096);
     expect_true("section below ABI limit", section_size <=
         SPD_RING_MAX_SECTION_BYTES);
     expect_true("no-buffer sentinel", SPD_RING_NO_BUFFER == UINT32_MAX);
-    expect_true("slot zero starts at buffer offset", buffer_offset < section_size);
-    expect_true("last slot is in section", buffer_offset +
+    expect_true("minimum queue depth", SPD_RING_MIN_QUEUE_DEPTH == 2);
+    expect_true("maximum queue depth", SPD_RING_MAX_QUEUE_DEPTH == 4096);
+    expect_true("equal request and buffer capacities", queue_depth == buffer_count);
+    expect_true("buffer zero starts at buffer offset", buffer_offset < section_size);
+    expect_true("last buffer is in section", buffer_offset +
         (uint64_t)(buffer_count - 1) * buffer_size + buffer_size <= section_size);
+    expect_true("cursor subtraction wraps", (uint32_t)(5 - (UINT32_MAX - 3)) == 9);
+    expect_true("request cursor wrap stays within depth",
+        (uint32_t)(1 - (UINT32_MAX - 1)) == 3 &&
+        (uint32_t)(1 - (UINT32_MAX - 1)) <= 4);
+    expect_true("completion cursor wrap stays within depth",
+        (uint32_t)(2 - (UINT32_MAX - 2)) == 5 &&
+        (uint32_t)(2 - (UINT32_MAX - 2)) <= 8);
 }
 
 static void expect_valid(

@@ -1175,3 +1175,23 @@ partition has been opened.
   232.2 us mean latency; random write measured 164,571 IOPS and 192.09 us mean
   latency. These remain single-run results; the earlier legacy references
   were 97,451 random-read IOPS and 135,760 random-write IOPS.
+
+### 2026-10-05 — Shared Ring V3 implementation
+
+- Replaced the V2 slot/bitmap ABI with the V3 request and completion envelopes,
+  cache-line cursors, fixed buffer references, and acquire/release cursor
+  helpers. `SPD_IOCTL_TRANSACT_REQ`, `SPD_IOCTL_TRANSACT_RSP`, and `Hint`
+  semantics remain the canonical WinSpd transaction and correlation path.
+- Replaced the kernel pending-slot table with a fixed O(1) LIFO buffer pool and
+  owner metadata. The kernel retains one producer for `RING_WAIT` and one
+  consumer for `RING_KICK`; userspace uses a pump, worker pool, active-Hint
+  lookup, and IOCP notifications.
+- Added integration coverage for V3 layout validation, batching at the full
+  queue boundary, cursor progress, buffer reuse and ownership, synchronous and
+  deferred responses, out-of-order workers, bulk-data visibility, saturation,
+  and shutdown with active workers.
+- The x64 WinSpd test executable and ARM64 WinSpd driver/DLL build. The ARM64
+  WslPart proxy builds and the translation tests pass. This session is not
+  elevated, so the V3 driver-backed ring tests and real-device stress or
+  benchmark runs were not executed. No V3 runtime or performance result is
+  claimed; the earlier V1/V2 measurements remain historical only.

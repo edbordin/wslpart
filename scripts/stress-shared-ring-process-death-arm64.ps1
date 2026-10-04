@@ -151,7 +151,7 @@ try {
         throw 'The synthetic WslPart disk remained after proxy process death.'
     }
 
-    Write-Host 'SharedRingV1 process-death cleanup passed; no synthetic disk remains.'
+    Write-Host 'SharedRingV3 process-death cleanup passed; no synthetic disk remains.'
 }
 finally {
     Stop-Fio

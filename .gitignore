@@ -1,6 +1,7 @@
 # Build and experiment output
 artifacts/
 build/
+.local-signing/
 *.rawdisk
 *.vhd
 

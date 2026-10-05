@@ -1,9 +1,7 @@
 [CmdletBinding()]
 param(
-    [string]$DriverCertificateThumbprint =
-        '64B3E16025809AD247D19DE39FAE8455CC52F75A',
-    [string]$CatalogCertificateThumbprint =
-        'F4AC1AEDDF8C18957E97AE0F6DC05E932BFBF209'
+    [string]$DriverCertificateThumbprint,
+    [string]$CatalogCertificateThumbprint
 )
 
 $ErrorActionPreference = 'Stop'
@@ -14,6 +12,26 @@ $infPath = Join-Path $packageDirectory 'winspd-ARM64.inf'
 $sysPath = Join-Path $packageDirectory 'winspd-ARM64.sys'
 $dllPath = Join-Path $packageDirectory 'winspd-ARM64.dll'
 $catPath = Join-Path $packageDirectory 'winspd-arm64.cat'
+
+$DefaultSigningSubject = 'CN=WinSpd Shared Ring Test Signing'
+$DefaultSigningCertificate = Get-ChildItem Cert:\CurrentUser\My |
+    Where-Object { $_.Subject -eq $DefaultSigningSubject -and $_.HasPrivateKey } |
+    Sort-Object NotAfter -Descending |
+    Select-Object -First 1
+
+if ([string]::IsNullOrWhiteSpace($DriverCertificateThumbprint)) {
+    if ($null -eq $DefaultSigningCertificate) {
+        throw "No signing certificate found. Run scripts\new-winspd-test-signing-cert.ps1 first."
+    }
+    $DriverCertificateThumbprint = $DefaultSigningCertificate.Thumbprint
+}
+
+if ([string]::IsNullOrWhiteSpace($CatalogCertificateThumbprint)) {
+    if ($null -eq $DefaultSigningCertificate) {
+        throw "No signing certificate found. Run scripts\new-winspd-test-signing-cert.ps1 first."
+    }
+    $CatalogCertificateThumbprint = $DefaultSigningCertificate.Thumbprint
+}
 
 foreach ($path in @($infPath, $sysPath, $dllPath)) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {

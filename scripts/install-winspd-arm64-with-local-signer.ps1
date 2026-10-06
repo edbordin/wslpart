@@ -147,6 +147,13 @@ if ($pnputilExitCode -notin @(0, 259, 3010)) {
     throw "PnPUtil failed with exit code $pnputilExitCode."
 }
 
+$restartOutput = @(& pnputil.exe /restart-device $DeviceInstanceId 2>&1)
+$restartExitCode = $LASTEXITCODE
+$restartOutput | ForEach-Object { Write-Host $_ }
+if ($restartExitCode -notin @(0, 3010)) {
+    throw "PnPUtil could not restart device $DeviceInstanceId (exit $restartExitCode)."
+}
+
 $device = Get-PnpDevice -InstanceId $DeviceInstanceId -ErrorAction Stop
 $selection = @(& pnputil.exe /enum-devices /instanceid $DeviceInstanceId /drivers 2>&1)
 $selectedInfLine = $selection | Where-Object { $_ -match '^\s*Driver Name:' } | Select-Object -First 1
@@ -160,7 +167,8 @@ Write-Host "Selected version: $selectedVersionLine"
 Write-Host "Built SYS SHA256: $builtHash"
 Write-Host "Loaded SYS SHA256: $activeHash"
 
-if ($activeHash -eq $builtHash -and $selectedVersionLine -match '1\.0\.26283\.0') {
+if ($activeHash -eq $builtHash -and
+    $selectedVersionLine -match $driverVersionPattern) {
     Write-Host 'The V3 driver is active and matches the signed build.'
 }
 elseif ($pnputilExitCode -eq 3010 -or ($pnputilOutput -join "`n") -match 'reboot|restart') {

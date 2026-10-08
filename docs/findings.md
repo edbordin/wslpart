@@ -1205,6 +1205,11 @@ partition has been opened.
   including publish-before-WAIT, post-versus-reset, producer concurrency, and
   WAIT teardown. The ARM64 WslPart build and translation tests passed; the
   V4 mapping probe reported SQ/CQ depth 64, 128 buffers, and 1 MiB buffers.
+- The WDK 26100 ARM64 build needed `STOR_ADDRESS_TYPE_NVME=0x2`; that value is
+  now part of the ARM64 project settings. A normal rebuild without an
+  environment override succeeded. The resulting version `1.0.26282.4` package
+  was installed with a matching SYS hash, and the focused post-cancel race
+  test passed again.
 - Ran one matched direct-I/O fio pass at QD32 and QD128 on the scratch-backed
   partition and the WSL VHDX baseline. Both used fio 3.41 `io_uring`, 256-MiB
   files, guest flush policy, unbuffered overlapped source I/O, eight

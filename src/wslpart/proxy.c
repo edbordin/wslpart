@@ -1974,7 +1974,7 @@ int wmain(int argc, wchar_t **argv)
         SPD_RING_HEADER *ring_header;
 
         memset(&ring_params, 0, sizeof ring_params);
-        ring_params.Version = SPD_RING_VERSION_4;
+        ring_params.Version = SPD_RING_VERSION;
         ring_params.QueueDepth = ring_depth;
         ring_params.BufferCount = buffer_count;
         ring_params.BufferSize = max_transfer_length;
@@ -1990,7 +1990,7 @@ int wmain(int argc, wchar_t **argv)
 
         ring_header = storage_unit->SharedRingHeader;
         if (0 == ring_header ||
-            SPD_RING_VERSION_4 != ring_header->Version ||
+            SPD_RING_VERSION != ring_header->Version ||
             ring_params.QueueDepth != ring_header->QueueDepth ||
             ring_params.BufferCount != ring_header->BufferCount ||
             ring_params.BufferSize != ring_header->BufferSize)

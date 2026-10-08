@@ -1195,3 +1195,41 @@ partition has been opened.
   elevated, so the V3 driver-backed ring tests and real-device stress or
   benchmark runs were not executed. No V3 runtime or performance result is
   claimed; the earlier V1/V2 measurements remain historical only.
+
+### 2026-10-09 — SharedRing V4 correctness and matched QD benchmarks
+
+- Rebuilt and installed the ARM64 Debug driver as version `1.0.26282.3` and
+  verified that the loaded SYS hash matched the signed build. The isolated
+  `ioctl_ring_post_cancel_race_test` passed after its test-only reset
+  acknowledgment was added. All 22 ring integration tests then passed,
+  including publish-before-WAIT, post-versus-reset, producer concurrency, and
+  WAIT teardown. The ARM64 WslPart build and translation tests passed; the
+  V4 mapping probe reported SQ/CQ depth 64, 128 buffers, and 1 MiB buffers.
+- Ran one matched direct-I/O fio pass at QD32 and QD128 on the scratch-backed
+  partition and the WSL VHDX baseline. Both used fio 3.41 `io_uring`, 256-MiB
+  files, guest flush policy, unbuffered overlapped source I/O, eight
+  dispatchers, SharedRing SQ/CQ depth 64, 128 buffers, and 262144-byte maximum
+  transfers. The 20-second random workloads completed at measured queue-depth
+  lower bounds 32 and 64; fio's `>=64` histogram bucket prevents an exact
+  average-QD128 estimate.
+- Random-read/write results in IOPS (single runs):
+
+  | fio QD | Storage | Random read | Random write |
+  | ---: | --- | ---: | ---: |
+  | 32 | WSL VHDX | 137,359 | 90,961 |
+  | 32 | SharedRing partition | 45,390 | 69,127 |
+  | 128 | WSL VHDX | 94,659 | 78,588 |
+  | 128 | SharedRing partition | 183,708 | 178,763 |
+
+- The QD32 run submitted and published 2,298,274 responses, with 378,322 WAIT
+  submissions/completions, no SQ/CQ full events, no WorkItem exhaustion, and
+  no ring error. QD128 submitted and published 7,257,471 responses, with
+  227,572 WAIT submissions/completions, 10,502 SQ-full events, 48,011 CQ-full
+  events, no WorkItem exhaustion, and no ring error. Both proxy runs detached
+  the scratch partition and shut down cleanly. The benchmark's WslPart report
+  does not collect the kernel-only `BufferPoolExhaustions` DbgPrint counter;
+  the successful QD128 run validates progress with 128 configured buffers,
+  while that specific counter was not captured in these reports.
+- Reports are retained under `artifacts/m6/` with the
+  `sharedring-v4-notify-20261009` run tag, separate from any later batch-size
+  tuning.

@@ -2,24 +2,35 @@
 
 [CmdletBinding()]
 param(
-    [string]$DeviceInstanceId = 'ROOT\SCSIADAPTER\0000'
+    [string]$DeviceInstanceId = 'ROOT\SCSIADAPTER\0000',
+    [ValidateSet('Debug', 'Release')]
+    [string]$Configuration = 'Release'
 )
 
 $ErrorActionPreference = 'Stop'
 
 $workspace = Split-Path -Parent $PSScriptRoot
-$packageDirectory = Join-Path $workspace 'third_party\winspd\build\VStudio\build\Release'
+$packageDirectory = Join-Path $workspace "third_party\winspd\build\VStudio\build\$Configuration"
 $infPath = Join-Path $packageDirectory 'winspd-ARM64.inf'
 $sysPath = Join-Path $packageDirectory 'winspd-ARM64.sys'
 $dllPath = Join-Path $packageDirectory 'winspd-ARM64.dll'
+$dllPackagePath = if (Test-Path -LiteralPath $dllPath -PathType Leaf) {
+    $dllPath
+} else {
+    Join-Path $workspace 'third_party\winspd\build\VStudio\build\Release\winspd-ARM64.dll'
+}
 $catPath = Join-Path $packageDirectory 'winspd-arm64.cat'
 $loadedSysPath = Join-Path $env:SystemRoot 'System32\drivers\winspd-arm64.sys'
 $creator = Join-Path $PSScriptRoot 'new-winspd-test-signing-cert.ps1'
 
-foreach ($path in @($infPath, $sysPath, $dllPath)) {
+foreach ($path in @($infPath, $sysPath, $dllPackagePath)) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
         throw "Required ARM64 package file was not found: $path"
     }
+}
+if ($dllPackagePath -ne $dllPath) {
+    Copy-Item -LiteralPath $dllPackagePath -Destination $dllPath -Force
+    $dllPackagePath = $dllPath
 }
 
 & $creator
@@ -72,7 +83,7 @@ if ($LASTEXITCODE -ne 0) {
 $tempDirectory = Join-Path ([IO.Path]::GetTempPath()) ('winspd-inf2cat-' + [Guid]::NewGuid().ToString('N'))
 try {
     New-Item -ItemType Directory -Path $tempDirectory | Out-Null
-    Copy-Item -LiteralPath $infPath, $sysPath, $dllPath -Destination $tempDirectory
+    Copy-Item -LiteralPath $infPath, $sysPath, $dllPackagePath -Destination $tempDirectory
 
     & $inf2cat "/driver:$tempDirectory" /os:10_GE_ARM64,Server2025_ARM64 /uselocaltime
     if ($LASTEXITCODE -ne 0) {
@@ -169,7 +180,7 @@ Write-Host "Loaded SYS SHA256: $activeHash"
 
 if ($activeHash -eq $builtHash -and
     $selectedVersionLine -match $driverVersionPattern) {
-    Write-Host 'The V3 driver is active and matches the signed build.'
+    Write-Host "The SharedRing V4 $Configuration driver is active and matches the signed build."
 }
 elseif ($pnputilExitCode -eq 3010 -or ($pnputilOutput -join "`n") -match 'reboot|restart') {
     Write-Host 'The signed package is staged; restart Windows to activate it, then re-run the driver/hash check.'

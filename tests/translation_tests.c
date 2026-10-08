@@ -45,7 +45,8 @@ static void test_ring_abi(void)
     section_size = ring_align_up(buffer_offset +
         (uint64_t)buffer_count * buffer_size, 4096);
 
-    expect_true("ring ref has no payload", sizeof(SPD_RING_BUFFER_REF) == 16);
+    expect_true("ring ref contains id and length",
+        sizeof(SPD_RING_BUFFER_REF) == 2 * sizeof(uint32_t));
     expect_true("ring request is envelope only", sizeof(SPD_RING_REQUEST) ==
         sizeof(SPD_IOCTL_TRANSACT_REQ) + sizeof(SPD_RING_BUFFER_REF));
     expect_true("ring completion envelopes response", sizeof(SPD_RING_COMPLETION) ==

@@ -7,6 +7,7 @@ try {
     '===== START matched-fastest-qd32 =====' |
         Out-File -LiteralPath $logPath -Append -Encoding utf8
     & $benchmark -QueueDepth 32 -ReadCacheMode cold `
+        -BufferCount 128 `
         -RunTag matched-fastest-qd32 -DirectIO `
         -ProxySyncPolicy guest -ProxyBuffering none `
         -ProxyDispatcherThreads 8 -ProxyIOMode overlapped `
@@ -20,6 +21,7 @@ try {
     '===== START matched-fastest-qd128 =====' |
         Out-File -LiteralPath $logPath -Append -Encoding utf8
     & $benchmark -QueueDepth 128 -ReadCacheMode cold `
+        -BufferCount 128 `
         -RunTag matched-fastest-qd128 -DirectIO `
         -ProxySyncPolicy guest -ProxyBuffering none `
         -ProxyDispatcherThreads 8 -ProxyIOMode overlapped `

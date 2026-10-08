@@ -25,6 +25,8 @@ param(
     [int]$ProxyDispatcherThreads = 0,
     [ValidateRange(1, 256)]
     [int]$RingDepth = 64,
+    [ValidateRange(128, 65536)]
+    [int]$BufferCount = 128,
     [ValidateRange(4096, 1048576)]
     [int]$MaxTransferLength = 1048576,
     [ValidateSet('sync', 'overlapped')]
@@ -300,7 +302,7 @@ function Invoke-FioJob {
         FioOptions = $Job.Options
         FioIoEngine = $IoEngine
         RequestedQueueDepth = $QueueDepth
-        AverageQueueDepth = [math]::Round($actualQueueDepth, 2)
+        AverageQueueDepthLowerBound = [math]::Round($actualQueueDepth, 2)
         FioQueueDepthHistogram = $jobData.iodepth_level
         ReadClatP50Us = Get-FioClatUs $read 50.0
         ReadClatP95Us = Get-FioClatUs $read 95.0
@@ -372,6 +374,8 @@ try {
     if ($ProxyTransport -eq 'shared-ring') {
         $arguments += '--ring-depth'
         $arguments += [string]$RingDepth
+        $arguments += '--buffer-count'
+        $arguments += [string]$BufferCount
     }
     if ($ProxyFuaUnlocked) { $arguments += '--fua-unlocked' }
     elseif ($ProxyFua) { $arguments += '--fua' }
@@ -424,17 +428,25 @@ try {
             -Pattern 'SharedRing batches submissions=' |
             Select-Object -Last 1
         if ($null -ne $batchLine -and $batchLine.Line -match
-            'submissions=(\d+) requests=(\d+) max=(\d+) completions=(\d+) responses=(\d+) max=(\d+) workers=(\d+) depth=(\d+) buffer_size=(\d+)') {
+            'submissions=(\d+) requests=(\d+) max=(\d+) completions=(\d+) responses_queued=(\d+) responses_published=(\d+) max=(\d+) workers=(\d+) sq_full=(\d+) cq_full=(\d+) workitems_starved=(\d+) waits=(\d+)/(\d+) depth=(\d+) buffers=(\d+) buffer_size=(\d+) error=(\d+)') {
             $ringStats = [pscustomobject]@{
                 SubmissionBatches = [UInt64]$Matches[1]
                 SubmittedRequests = [UInt64]$Matches[2]
                 MaxSubmissionBatch = [UInt32]$Matches[3]
                 CompletionBatches = [UInt64]$Matches[4]
-                CompletedResponses = [UInt64]$Matches[5]
-                MaxCompletionBatch = [UInt32]$Matches[6]
-                Workers = [UInt32]$Matches[7]
-                QueueDepth = [UInt32]$Matches[8]
-                BufferSize = [UInt32]$Matches[9]
+                QueuedResponses = [UInt64]$Matches[5]
+                PublishedResponses = [UInt64]$Matches[6]
+                MaxCompletionBatch = [UInt32]$Matches[7]
+                Workers = [UInt32]$Matches[8]
+                SqFullEvents = [UInt64]$Matches[9]
+                CqFullEvents = [UInt64]$Matches[10]
+                WorkItemExhaustions = [UInt64]$Matches[11]
+                WaitSubmissions = [UInt64]$Matches[12]
+                WaitCompletions = [UInt64]$Matches[13]
+                QueueDepth = [UInt32]$Matches[14]
+                BufferCount = [UInt32]$Matches[15]
+                BufferSize = [UInt32]$Matches[16]
+                Error = [UInt32]$Matches[17]
             }
         }
     }
@@ -462,9 +474,12 @@ try {
         RandomWriteEndFsync = -not [bool]$OmitRandomWriteEndFsync
         IoStats = [bool]$IoStats
         RingDepth = if ($ProxyTransport -eq 'shared-ring') { $RingDepth } else { $null }
+        RingBufferCount = if ($ProxyTransport -eq 'shared-ring') {
+            $BufferCount
+        } else { $null }
         MaxTransferLength = $MaxTransferLength
         RingBufferPoolBytes = if ($ProxyTransport -eq 'shared-ring') {
-            [UInt64]$RingDepth * [UInt64]$MaxTransferLength
+            [UInt64]$BufferCount * [UInt64]$MaxTransferLength
         } else { $null }
         RingStats = $ringStats
         ProxyFua = [bool]$ProxyFua

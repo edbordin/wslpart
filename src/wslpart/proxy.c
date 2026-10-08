@@ -13,6 +13,10 @@ typedef enum wslpart_sync_policy {
     WSLPART_SYNC_GUEST,
 } WSLPART_SYNC_POLICY;
 
+#define WSLPART_IOCP_BATCH_SIZE 64
+
+typedef struct wslpart_async_io WSLPART_ASYNC_IO;
+
 typedef struct wslpart_source {
     HANDLE handle;
     HANDLE fua_handle;
@@ -43,6 +47,9 @@ typedef struct wslpart_source {
     volatile LONG iocp_pending;
     volatile LONG iocp_stop;
     SRWLOCK iocp_lock;
+    SLIST_HEADER async_io_free;
+    WSLPART_ASYNC_IO *async_io_pool;
+    UINT32 async_io_capacity;
     volatile LONG64 io_stats_submitted[2];
     volatile LONG64 io_stats_completed[2];
     volatile LONG64 io_stats_slow[2];
@@ -232,12 +239,17 @@ static BOOL source_io_at(
 
 static BOOL flush_backing_store(WSLPART_SOURCE *source, DWORD *error);
 
-typedef struct wslpart_async_io {
+typedef struct
+__declspec(align(MEMORY_ALLOCATION_ALIGNMENT))
+wslpart_async_io
+{
+    SLIST_ENTRY free_entry;
     OVERLAPPED overlapped;
     WSLPART_SOURCE *source;
     SPD_STORAGE_UNIT *storage_unit;
     SPD_IOCTL_TRANSACT_RSP response;
     PVOID buffer;
+    HANDLE io_handle;
     DWORD length;
     UINT64 offset;
     LARGE_INTEGER submitted_qpc;
@@ -246,6 +258,81 @@ typedef struct wslpart_async_io {
     BOOL flush_after;
     BOOL write_gate_held;
 } WSLPART_ASYNC_IO;
+
+static DWORD source_async_pool_create(
+    WSLPART_SOURCE *source,
+    UINT32 capacity)
+{
+    SIZE_T bytes;
+
+    if (0 == capacity ||
+        capacity > SIZE_MAX / sizeof(WSLPART_ASYNC_IO))
+        return ERROR_INVALID_PARAMETER;
+
+    bytes = (SIZE_T)capacity * sizeof(WSLPART_ASYNC_IO);
+
+    source->async_io_pool = VirtualAlloc(
+        0,
+        bytes,
+        MEM_RESERVE | MEM_COMMIT,
+        PAGE_READWRITE);
+
+    if (0 == source->async_io_pool)
+        return GetLastError();
+
+    source->async_io_capacity = capacity;
+
+    InitializeSListHead(&source->async_io_free);
+
+    for (UINT32 i = 0; i < capacity; i++)
+    {
+        InterlockedPushEntrySList(
+            &source->async_io_free,
+            &source->async_io_pool[i].free_entry);
+    }
+
+    return ERROR_SUCCESS;
+}
+
+static VOID source_async_pool_destroy(WSLPART_SOURCE *source)
+{
+    if (0 != source->async_io_pool)
+    {
+        VirtualFree(source->async_io_pool, 0, MEM_RELEASE);
+        source->async_io_pool = 0;
+        source->async_io_capacity = 0;
+    }
+}
+
+static WSLPART_ASYNC_IO *source_async_alloc(
+    WSLPART_SOURCE *source)
+{
+    PSLIST_ENTRY entry = InterlockedPopEntrySList(
+        &source->async_io_free);
+
+    if (0 == entry)
+        return 0;
+
+    WSLPART_ASYNC_IO *io = CONTAINING_RECORD(
+        entry,
+        WSLPART_ASYNC_IO,
+        free_entry);
+
+    memset(io, 0, sizeof *io);
+
+    return io;
+}
+
+static VOID source_async_free(WSLPART_ASYNC_IO *io)
+{
+    WSLPART_SOURCE *source = io->source;
+
+    memset(io, 0, sizeof *io);
+
+    InterlockedPushEntrySList(
+        &source->async_io_free,
+        &io->free_entry);
+}
 
 static LONG64 read_counter64(volatile LONG64 *counter)
 {
@@ -338,115 +425,196 @@ static void log_io_stats(WSLPART_SOURCE *source)
         read_counter64(&source->io_stats_response_max_us));
 }
 
+static VOID complete_source_async(
+    WSLPART_ASYNC_IO *io,
+    DWORD transferred,
+    DWORD error)
+{
+    WSLPART_SOURCE *source = io->source;
+    BOOL io_ok = ERROR_SUCCESS == error &&
+        transferred == io->length;
+    BOOL response_timing = FALSE;
+    LARGE_INTEGER response_start = { 0 };
+    LARGE_INTEGER response_end = { 0 };
+
+    if (!io_ok && ERROR_SUCCESS == error)
+        error = ERROR_HANDLE_EOF;
+
+    record_io_latency(source, io);
+
+    if (io->write && io->write_gate_held)
+    {
+        /* The data I/O is complete before a post-write flush. */
+        complete_source_write(source);
+        io->write_gate_held = FALSE;
+    }
+
+    if (io_ok && io->write && io->flush_after)
+    {
+        DWORD flush_error = ERROR_SUCCESS;
+        if (!flush_backing_store(source, &flush_error))
+        {
+            io_ok = FALSE;
+            error = flush_error;
+        }
+    }
+
+    if (!io_ok)
+    {
+        SpdDebugLog("wslpart async %s completion "
+            "length=%lu transferred=%lu error=%lu "
+            "fua=%u flush_after=%u\n",
+            io->write ? "write" : "read",
+            (unsigned long)io->length,
+            (unsigned long)transferred,
+            (unsigned long)error,
+            (unsigned)io->force_unit_access,
+            (unsigned)io->flush_after);
+
+        SpdStorageUnitStatusSetSense(
+            &io->response.Status,
+            SCSI_SENSE_MEDIUM_ERROR,
+            io->write ?
+                SCSI_ADSENSE_WRITE_ERROR :
+                SCSI_ADSENSE_UNRECOVERED_ERROR,
+            0);
+    }
+
+    if (source->io_stats)
+        response_timing = QueryPerformanceCounter(&response_start);
+
+    SpdStorageUnitSendResponse(
+        io->storage_unit,
+        &io->response,
+        io->buffer);
+
+    if (response_timing && QueryPerformanceCounter(&response_end))
+    {
+        UINT64 response_us =
+            ((UINT64)(response_end.QuadPart -
+                response_start.QuadPart) * 1000000ULL) /
+            (UINT64)source->io_stats_frequency.QuadPart;
+
+        update_max64(
+            &source->io_stats_response_max_us,
+            (LONG64)response_us);
+
+        if (1000ULL <= response_us)
+            InterlockedIncrement64(
+                &source->io_stats_response_slow);
+    }
+
+    source_async_free(io);
+
+    InterlockedDecrement(&source->iocp_pending);
+}
+
 static DWORD WINAPI source_iocp_thread(PVOID context)
 {
     WSLPART_SOURCE *source = context;
+    OVERLAPPED_ENTRY entries[WSLPART_IOCP_BATCH_SIZE];
 
     for (;;)
     {
-        ULONG_PTR completion_key = 0;
-        OVERLAPPED *overlapped = 0;
-        DWORD transferred = 0;
-        BOOL ok;
+        ULONG removed = 0;
+        BOOL ok = GetQueuedCompletionStatusEx(
+            source->iocp,
+            entries,
+            ARRAYSIZE(entries),
+            &removed,
+            INFINITE,
+            FALSE);
 
-        ok = GetQueuedCompletionStatus(source->iocp, &transferred,
-            &completion_key, &overlapped, INFINITE);
-        if (0 == overlapped)
+        if (!ok)
         {
-            if (0 != source->iocp_stop && 0 == source->iocp_pending)
+            DWORD error = GetLastError();
+
+            if (0 != source->iocp_stop &&
+                0 == InterlockedCompareExchange(
+                    &source->iocp_pending,
+                    0,
+                    0))
                 break;
-            continue;
+
+            SpdDebugLog(
+                "wslpart IOCP dequeue failed error=%lu\n",
+                (unsigned long)error);
+
+            return error;
         }
 
+        for (ULONG i = 0; i < removed; i++)
         {
-            WSLPART_ASYNC_IO *io = CONTAINING_RECORD(overlapped,
-                WSLPART_ASYNC_IO, overlapped);
-            DWORD error = ok ? ERROR_SUCCESS : GetLastError();
-            BOOL io_ok = ok && transferred == io->length;
-            BOOL response_timing = FALSE;
-            LARGE_INTEGER response_start = { 0 };
-            LARGE_INTEGER response_end = { 0 };
+            OVERLAPPED_ENTRY *entry = &entries[i];
 
-            if (!io_ok && ERROR_SUCCESS == error)
-                error = ERROR_HANDLE_EOF;
+            if (0 == entry->lpOverlapped)
+                continue;
 
-            record_io_latency(io->source, io);
+            WSLPART_ASYNC_IO *io = CONTAINING_RECORD(
+                entry->lpOverlapped,
+                WSLPART_ASYNC_IO,
+                overlapped);
+            DWORD transferred = entry->dwNumberOfBytesTransferred;
+            DWORD error = ERROR_SUCCESS;
 
-            if (io->write && io->write_gate_held)
+            /* Successful asynchronous file I/O normally has
+             * Internal == STATUS_SUCCESS == 0. Only failures need
+             * the slower GetOverlappedResult path. */
+            if (0 != entry->Internal)
             {
-                /* The data I/O is complete before a post-write flush. */
-                complete_source_write(io->source);
-                io->write_gate_held = FALSE;
+                DWORD actual = transferred;
+
+                if (!GetOverlappedResult(
+                        io->io_handle,
+                        &io->overlapped,
+                        &actual,
+                        FALSE))
+                    error = GetLastError();
+                else
+                    transferred = actual;
             }
 
-            if (io_ok && io->write && io->flush_after)
-            {
-                DWORD flush_error = ERROR_SUCCESS;
-                if (!flush_backing_store(io->source, &flush_error))
-                {
-                    io_ok = FALSE;
-                    error = flush_error;
-                }
-            }
-
-            if (!io_ok)
-            {
-                SpdDebugLog("wslpart async %s offset completion length=%lu "
-                    "transferred=%lu error=%lu fua=%u flush_after=%u\n",
-                    io->write ? "write" : "read",
-                    (unsigned long)io->length,
-                    (unsigned long)transferred,
-                    (unsigned long)error,
-                    (unsigned)io->force_unit_access,
-                    (unsigned)io->flush_after);
-                SpdStorageUnitStatusSetSense(&io->response.Status,
-                    SCSI_SENSE_MEDIUM_ERROR,
-                    io->write ? SCSI_ADSENSE_WRITE_ERROR :
-                        SCSI_ADSENSE_UNRECOVERED_ERROR, 0);
-            }
-
-            if (io->source->io_stats)
-                response_timing = QueryPerformanceCounter(&response_start);
-            SpdStorageUnitSendResponse(io->storage_unit,
-                &io->response, io->buffer);
-            if (response_timing &&
-                QueryPerformanceCounter(&response_end))
-            {
-                UINT64 response_us = ((UINT64)(response_end.QuadPart -
-                    response_start.QuadPart) * 1000000ULL) /
-                    (UINT64)io->source->io_stats_frequency.QuadPart;
-                update_max64(&io->source->io_stats_response_max_us,
-                    (LONG64)response_us);
-                if (1000ULL <= response_us)
-                    InterlockedIncrement64(
-                        &io->source->io_stats_response_slow);
-            }
-            HeapFree(GetProcessHeap(), 0, io);
+            complete_source_async(io, transferred, error);
         }
 
-        if (0 == InterlockedDecrement(&source->iocp_pending) &&
-            0 != source->iocp_stop)
+        if (0 != source->iocp_stop &&
+            0 == InterlockedCompareExchange(
+                &source->iocp_pending,
+                0,
+                0))
             break;
     }
 
     return ERROR_SUCCESS;
 }
 
-static DWORD start_source_iocp(WSLPART_SOURCE *source)
+static DWORD start_source_iocp(
+    WSLPART_SOURCE *source,
+    UINT32 max_outstanding)
 {
+    DWORD error;
+
     if (!source->overlapped || 0 != source->iocp)
         return source->overlapped ? ERROR_SUCCESS : ERROR_INVALID_PARAMETER;
 
+    error = source_async_pool_create(source, max_outstanding);
+    if (ERROR_SUCCESS != error)
+        return error;
+
     source->iocp = CreateIoCompletionPort(source->handle, 0, 0, 0);
     if (0 == source->iocp)
-        return GetLastError();
+    {
+        error = GetLastError();
+        goto fail;
+    }
+
     if (INVALID_HANDLE_VALUE != source->fua_handle &&
         0 == CreateIoCompletionPort(source->fua_handle, source->iocp, 0, 0))
     {
-        DWORD error = GetLastError();
+        error = GetLastError();
         CloseHandle(source->iocp);
         source->iocp = 0;
-        return error;
+        goto fail;
     }
 
     InterlockedExchange(&source->iocp_pending, 0);
@@ -455,12 +623,16 @@ static DWORD start_source_iocp(WSLPART_SOURCE *source)
         0, 0);
     if (0 == source->iocp_thread)
     {
-        DWORD error = GetLastError();
+        error = GetLastError();
         CloseHandle(source->iocp);
         source->iocp = 0;
-        return error;
+        goto fail;
     }
     return ERROR_SUCCESS;
+
+fail:
+    source_async_pool_destroy(source);
+    return error;
 }
 
 static void stop_source_iocp(WSLPART_SOURCE *source)
@@ -485,6 +657,7 @@ static void stop_source_iocp(WSLPART_SOURCE *source)
     }
     CloseHandle(source->iocp);
     source->iocp = 0;
+    source_async_pool_destroy(source);
     ReleaseSRWLockExclusive(&source->iocp_lock);
 }
 
@@ -516,9 +689,26 @@ static BOOLEAN submit_source_async(
         return TRUE;
     }
 
-    io = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof *io);
+    handle = write && force_unit_access &&
+        INVALID_HANDLE_VALUE != source->fua_handle ? source->fua_handle :
+        source->handle;
+
+    AcquireSRWLockShared(&source->iocp_lock);
+    if (0 == source->iocp)
+    {
+        ReleaseSRWLockShared(&source->iocp_lock);
+        if (write)
+            complete_source_write(source);
+        SpdStorageUnitStatusSetSense(status,
+            SCSI_SENSE_HARDWARE_ERROR, SCSI_ADSENSE_INTERNAL_TARGET_FAILURE,
+            0);
+        return TRUE;
+    }
+
+    io = source_async_alloc(source);
     if (0 == io)
     {
+        ReleaseSRWLockShared(&source->iocp_lock);
         SpdStorageUnitStatusSetSense(status,
             SCSI_SENSE_HARDWARE_ERROR, SCSI_ADSENSE_INTERNAL_TARGET_FAILURE,
             0);
@@ -531,6 +721,7 @@ static BOOLEAN submit_source_async(
     io->storage_unit = storage_unit;
     io->response = *operation->Response;
     io->buffer = buffer;
+    io->io_handle = handle;
     io->length = length;
     io->offset = offset;
     io->write = write;
@@ -541,22 +732,7 @@ static BOOLEAN submit_source_async(
     io->overlapped.OffsetHigh = (DWORD)(offset >> 32);
     if (source->io_stats)
         QueryPerformanceCounter(&io->submitted_qpc);
-    handle = write && force_unit_access &&
-        INVALID_HANDLE_VALUE != source->fua_handle ? source->fua_handle :
-        source->handle;
 
-    AcquireSRWLockShared(&source->iocp_lock);
-    if (0 == source->iocp)
-    {
-        ReleaseSRWLockShared(&source->iocp_lock);
-        HeapFree(GetProcessHeap(), 0, io);
-        if (write)
-            complete_source_write(source);
-        SpdStorageUnitStatusSetSense(status,
-            SCSI_SENSE_HARDWARE_ERROR, SCSI_ADSENSE_INTERNAL_TARGET_FAILURE,
-            0);
-        return TRUE;
-    }
     InterlockedIncrement(&source->iocp_pending);
     if (source->io_stats)
         update_max32(&source->io_stats_pending_max,
@@ -568,7 +744,7 @@ static BOOLEAN submit_source_async(
     {
         InterlockedDecrement(&source->iocp_pending);
         ReleaseSRWLockShared(&source->iocp_lock);
-        HeapFree(GetProcessHeap(), 0, io);
+        source_async_free(io);
         if (write)
             complete_source_write(source);
         SpdStorageUnitStatusSetSense(status,
@@ -1834,7 +2010,7 @@ int wmain(int argc, wchar_t **argv)
         }
 
         source.shared_ring = TRUE;
-        error = start_source_iocp(&source);
+        error = start_source_iocp(&source, ring_depth);
         if (ERROR_SUCCESS != error)
         {
             print_win32_error(L"start source IOCP", error);

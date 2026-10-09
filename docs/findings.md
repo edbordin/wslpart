@@ -1238,3 +1238,22 @@ partition has been opened.
 - Reports are retained under `artifacts/m6/` with the
   `sharedring-v4-notify-20261009` run tag, separate from any later batch-size
   tuning.
+
+### 2026-10-09 - SharedRing producer and completion batch refactor
+
+- Replaced the shared-ring producer DPC with a Storport worker at
+  `PASSIVE_LEVEL`. The worker prepares requests and copies WRITE payloads
+  outside the IOQ lock, then commits a full SQ-credit batch while holding
+  `Ring->Lock` followed by `Ioq->SpinLock`. READ completion copies also run
+  outside both locks. Explicit SRB leases defer cancel/reset completion until
+  the preparation or completion operation releases ownership.
+- Added deterministic integration cases for cancellation/reset/STOP during
+  payload copies, batch compaction, SQ-credit resumption, and multi-chunk data
+  offsets. The WinSpd ARM64 Debug driver and x64 integration-test executable
+  both build successfully. The WslPart ARM64 Release build and translation
+  tests pass.
+- The driver-backed ring suite, post/reset race run, WslPart end-to-end tests,
+  attach/detach stress, Driver Verifier, and performance benchmarks were not
+  run. This environment has no isolated test OS, and the driver was not
+  installed on the primary OS. No runtime correctness or performance result
+  is claimed for this refactor.

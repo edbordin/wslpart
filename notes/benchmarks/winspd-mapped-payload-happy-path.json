@@ -1,0 +1,95 @@
+{
+  "status": "HappyPathVerified_PerformanceExploratory",
+  "verification": {
+    "write_bytes": 67108864,
+    "read_bytes": 67108864,
+    "crc": "crc32c",
+    "error": 0,
+    "mapped_leases": 384,
+    "mapped_bytes": 100663296,
+    "unmapped_leases": 384,
+    "run": "mapping-happy-v225-verify"
+  },
+  "sessions": {
+    "mapping": {
+      "run": "mapping-happy-v225-qd32",
+      "mapping": {
+        "threshold_bytes": 65536,
+        "attempts": 93297,
+        "mapped": 93297,
+        "fallback": 0,
+        "unmapped": 93297,
+        "bytes": 24457248768,
+        "map_ticks": 6786771,
+        "unmap_ticks": 7625730
+      },
+      "driver_hash": "0EC73DDF02AB9A2C59827735E8412049C17B4DAD301311C13FA094C49E7710FA",
+      "proxy_hash": "D456CBF9F717FAAA1AC492F514207C3C00078F6574BDF3BC455D69EA7863E4B2",
+      "dll_hash": "AB043FD9BD0889A1611AE320647805B55B65B2560760B81B34FEA56E75CCA7C1"
+    },
+    "copy": {
+      "run": "mapping-happy-v226-copy-qd32",
+      "mapping": {
+        "threshold_bytes": 0,
+        "attempts": 0,
+        "mapped": 0,
+        "fallback": 0,
+        "unmapped": 0,
+        "bytes": 0,
+        "map_ticks": 0,
+        "unmap_ticks": 0
+      },
+      "driver_hash": "1AC3433B0436DA179228071F7DF0E2ABE884FA619E1A5C479560FB708C5BAB07",
+      "proxy_hash": "D456CBF9F717FAAA1AC492F514207C3C00078F6574BDF3BC455D69EA7863E4B2",
+      "dll_hash": "AB043FD9BD0889A1611AE320647805B55B65B2560760B81B34FEA56E75CCA7C1"
+    }
+  },
+  "rows": [
+    {
+      "mode": "mapping",
+      "workload": "seqwrite",
+      "mib_per_sec": 3099.980043411255,
+      "mean_us": 10288.376919467,
+      "p95_us": 13828.096,
+      "p99_us": 15532.032,
+      "proxy_cpu_cores": 0.5341,
+      "raw_fio_json": "C:\\Users\\Ed\\Documents\\wslpart\\artifacts\\m6\\fio-raw-mapping-happy-v225-qd32\\winspd-partition-seqwrite.json"
+    },
+    {
+      "mode": "mapping",
+      "workload": "seqread",
+      "mib_per_sec": 3106.7864265441895,
+      "mean_us": 10288.586627755,
+      "p95_us": 13172.736,
+      "p99_us": 14614.528,
+      "proxy_cpu_cores": 0.4606,
+      "raw_fio_json": "C:\\Users\\Ed\\Documents\\wslpart\\artifacts\\m6\\fio-raw-mapping-happy-v225-qd32\\winspd-partition-seqread.json"
+    },
+    {
+      "mode": "copy",
+      "workload": "seqwrite",
+      "mib_per_sec": 2501.5917224884033,
+      "mean_us": 12717.206094091,
+      "p95_us": 23986.176,
+      "p99_us": 30015.488,
+      "proxy_cpu_cores": 0.42219999999999996,
+      "raw_fio_json": "C:\\Users\\Ed\\Documents\\wslpart\\artifacts\\m6\\fio-raw-mapping-happy-v226-copy-qd32\\winspd-partition-seqwrite.json"
+    },
+    {
+      "mode": "copy",
+      "workload": "seqread",
+      "mib_per_sec": 3039.1451959609985,
+      "mean_us": 10517.899929354999,
+      "p95_us": 13303.808,
+      "p99_us": 15007.744,
+      "proxy_cpu_cores": 0.3281,
+      "raw_fio_json": "C:\\Users\\Ed\\Documents\\wslpart\\artifacts\\m6\\fio-raw-mapping-happy-v226-copy-qd32\\winspd-partition-seqread.json"
+    }
+  ],
+  "limitations": [
+    "One five-second run per workload/mode; mapping ran first",
+    "Debug drivers with matching work-item and batch settings; origin diagnostics enabled",
+    "Recovery and malformed/premature completion hardening remains incomplete",
+    "Preallocated payload buffers remain 256 KiB per slot"
+  ]
+}

@@ -1,17 +1,33 @@
 [CmdletBinding()]
 param(
     [string]$DriverCertificateThumbprint,
-    [string]$CatalogCertificateThumbprint
+    [string]$CatalogCertificateThumbprint,
+    [ValidateSet('Debug', 'Release')]
+    [string]$Configuration = 'Release',
+    [string]$PackageDirectory
 )
 
 $ErrorActionPreference = 'Stop'
 
 $workspace = Split-Path -Parent $PSScriptRoot
-$packageDirectory = Join-Path $workspace 'third_party\winspd\build\VStudio\build\Release'
+if ([string]::IsNullOrWhiteSpace($PackageDirectory)) {
+    $PackageDirectory = Join-Path $workspace "third_party\winspd\build\VStudio\build\$Configuration"
+}
+$packageDirectory = (Resolve-Path -LiteralPath $PackageDirectory).Path
 $infPath = Join-Path $packageDirectory 'winspd-ARM64.inf'
 $sysPath = Join-Path $packageDirectory 'winspd-ARM64.sys'
 $dllPath = Join-Path $packageDirectory 'winspd-ARM64.dll'
 $catPath = Join-Path $packageDirectory 'winspd-arm64.cat'
+
+# A failed build can leave an older SYS beside a newly stamped INF. Reject the
+# mixed package before signing; matching installed/built hashes cannot catch it.
+$packageInf = Get-Content -LiteralPath $infPath -Raw
+$packageVersion = [regex]::Match($packageInf, '(?im)^\s*DriverVer\s*=\s*[^,\r\n]+,\s*(\d+\.\d+\.\d+\.\d+)\s*$')
+$binaryInfo = (Get-Item -LiteralPath $sysPath).VersionInfo
+$binaryVersion = '{0}.{1}.{2}.{3}' -f $binaryInfo.FileMajorPart, $binaryInfo.FileMinorPart, $binaryInfo.FileBuildPart, $binaryInfo.FilePrivatePart
+if (-not $packageVersion.Success -or [version]$packageVersion.Groups[1].Value -ne [version]$binaryVersion) {
+    throw "INF/SYS version mismatch: INF=$($packageVersion.Groups[1].Value), SYS=$binaryVersion. Complete the driver build before signing."
+}
 
 $DefaultSigningSubject = 'CN=WinSpd Shared Ring Test Signing'
 $DefaultSigningCertificate = Get-ChildItem Cert:\CurrentUser\My |
@@ -91,6 +107,12 @@ try {
 }
 finally {
     if (Test-Path -LiteralPath $tempDirectory) {
+        $taskTempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\')
+        $resolvedTaskTemp = [IO.Path]::GetFullPath($tempDirectory)
+        if ((Split-Path -Parent $resolvedTaskTemp) -ne $taskTempRoot -or
+            (Split-Path -Leaf $resolvedTaskTemp) -notlike 'wslpart-inf2cat-*') {
+            throw "Refusing to remove a signing temporary directory outside its expected root: $resolvedTaskTemp"
+        }
         Remove-Item -LiteralPath $tempDirectory -Recurse -Force
     }
 }

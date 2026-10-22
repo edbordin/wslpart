@@ -4,6 +4,7 @@ build/
 .local-signing/
 *.rawdisk
 *.vhd
+__pycache__/
 
 # Local IDE state
 .vs/

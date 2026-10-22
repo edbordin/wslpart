@@ -1,0 +1,5 @@
+# Derived benchmark data stays available without obscuring the source review.
+notes/benchmarks/*.json linguist-generated=true
+notes/benchmarks/*.csv linguist-generated=true
+# Preserve literal unified-diff context markers in the baseline patch fixture.
+notes/benchmarks/*.patch linguist-generated=true whitespace=-blank-at-eol

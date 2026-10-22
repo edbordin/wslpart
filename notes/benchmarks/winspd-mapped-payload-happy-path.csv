@@ -1,0 +1,5 @@
+mode,workload,mib_per_sec,mean_us,p95_us,p99_us,proxy_cpu_cores,raw_fio_json
+mapping,seqwrite,3099.980043411255,10288.376919467,13828.096,15532.032,0.5341,C:\Users\Ed\Documents\wslpart\artifacts\m6\fio-raw-mapping-happy-v225-qd32\winspd-partition-seqwrite.json
+mapping,seqread,3106.7864265441895,10288.586627755,13172.736,14614.528,0.4606,C:\Users\Ed\Documents\wslpart\artifacts\m6\fio-raw-mapping-happy-v225-qd32\winspd-partition-seqread.json
+copy,seqwrite,2501.5917224884033,12717.206094091,23986.176,30015.488,0.42219999999999996,C:\Users\Ed\Documents\wslpart\artifacts\m6\fio-raw-mapping-happy-v226-copy-qd32\winspd-partition-seqwrite.json
+copy,seqread,3039.1451959609985,10517.899929354999,13303.808,15007.744,0.3281,C:\Users\Ed\Documents\wslpart\artifacts\m6\fio-raw-mapping-happy-v226-copy-qd32\winspd-partition-seqread.json

@@ -1,0 +1,5 @@
+{
+  "base_commit": "30649abb3f3c7ffdb1d24a2442e8b61149ca47c5",
+  "patch_sha256": "61518abc65d30633cb2e998b7c7aac8ded690bbddc626566339d99537e4b3be9",
+  "description": "Original staged producer and inline CQ completion, with scheduler/WAIT/cancellation prerequisites from the tested pre-slot checkpoint, corrected CDB and non-CDB FLUSH forwarding, logical FIFO FLUSH fence, and lock histogram instrumentation. No slot table, generation tokens, preparation worker, or completion worker. Benchmark-only baseline, not a supported teardown implementation."
+}

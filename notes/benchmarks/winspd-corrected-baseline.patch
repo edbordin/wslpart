@@ -1,0 +1,1147 @@
+diff --git a/src/sys/driver.h b/src/sys/driver.h
+index e8b2d15..cf241d4 100644
+--- a/src/sys/driver.h
++++ b/src/sys/driver.h
+@@ -212,6 +212,8 @@ FORCEINLINE VOID SpdSrbComplete(PVOID DeviceExtension, PVOID Srb, UCHAR SrbStatu
+     StorPortNotification(RequestComplete, DeviceExtension, Srb);
+ }
+ UCHAR SpdSrbExecuteScsi(PVOID DeviceExtension, PVOID Srb);
++BOOLEAN SpdSrbIsFlush(PVOID Srb);
++UCHAR SpdSrbPostFlush(PVOID DeviceExtension, PVOID Srb);
+ VOID SpdSrbExecuteScsiPrepare(PVOID SrbExtension, PVOID Context, PVOID DataBuffer);
+ UCHAR SpdSrbExecuteScsiComplete(PVOID SrbExtension, PVOID Context, PVOID DataBuffer);
+ UCHAR SpdSrbAbortCommand(PVOID DeviceExtension, PVOID Srb);
+@@ -318,15 +320,40 @@ retry:
+     return Result;
+ }
+ 
++/* Logarithmic upper-bound histograms. Callers serialize updates with their
++ * metadata lock or exclusive stage ownership. Storage is fixed per unit. */
++#define SPD_HISTOGRAM_BUCKETS 64
++typedef struct
++{
++    UINT64 Bins[SPD_HISTOGRAM_BUCKETS];
++} SPD_HISTOGRAM;
++
++FORCEINLINE VOID SpdHistogramRecord(SPD_HISTOGRAM *Histogram, UINT64 Value)
++{
++    ULONG Bucket = 0;
++    while (Value > 1 && Bucket + 1 < SPD_HISTOGRAM_BUCKETS)
++    {
++        Value = (Value >> 1) + (Value & 1);
++        Bucket++;
++    }
++    Histogram->Bins[Bucket]++;
++}
++VOID SpdHistogramLog(const SPD_HISTOGRAM *Histogram, PCSTR Name);
++
+ /* I/O queue */
+ typedef struct
+ {
+     PVOID DeviceExtension;
++    struct _SPD_STORAGE_UNIT *StorageUnit;
+     KSPIN_LOCK SpinLock;
+     volatile LONG64 SpinLockWaitTicks;
+     volatile LONG64 SpinLockHoldTicks;
+     volatile LONG64 SpinLockAcquisitions;
+     BOOLEAN Stopped;
++    ULONG ActiveSrbs;
++    UINT64 AcceptedSrbs, RetiredSrbs;
++    SPD_HISTOGRAM SpinLockWaitHistogram, SpinLockHoldHistogram;
++    BOOLEAN FlushInProgress;
+     BOOLEAN NonblockingConsumer;
+     SPD_QEVENT PendingEvent;
+     LIST_ENTRY PendingList, ProcessList;
+@@ -353,7 +380,13 @@ VOID SpdIoqReset(SPD_IOQ *Ioq, BOOLEAN Stop,
+     SPD_IOQ_RESET_REASON Reason);
+ BOOLEAN SpdIoqStopped(SPD_IOQ *Ioq);
+ VOID SpdIoqLogDiagnostics(SPD_IOQ *Ioq);
++VOID SpdStorageUnitRingTerminalReset(struct _SPD_STORAGE_UNIT *StorageUnit);
+ NTSTATUS SpdIoqCancelSrb(SPD_IOQ *Ioq, PVOID Srb);
++#if defined(WINSPD_TEST_BUILD)
++NTSTATUS SpdIoqTestCancel(SPD_IOQ *Ioq, UINT32 Kind,
++    UINT64 BlockAddress, UINT32 ExpectedState);
++BOOLEAN SpdSrbTestMatchesRange(PVOID Srb, UINT32 Kind, UINT64 BlockAddress);
++#endif
+ struct _SPD_STORAGE_UNIT;
+ struct _SPD_SRB_EXTENSION;
+ VOID SpdStorageUnitRingTestPrepareCopyBarrier(
+@@ -399,7 +432,9 @@ typedef enum
+     SpdRingSrbPending,
+     SpdRingSrbPreparing,
+     SpdRingSrbInFlight,
+-    SpdRingSrbCompleting
++    SpdRingSrbCompleting,
++    /* Detached from admission/processing; owned by a reset retirement batch. */
++    SpdRingSrbRetiring
+ } SPD_RING_SRB_STATE;
+ 
+ typedef struct _SPD_SRB_EXTENSION
+@@ -413,6 +448,7 @@ typedef struct _SPD_SRB_EXTENSION
+     ULONG ChunkOffset;
+     SPD_RING_SRB_STATE RingState;
+     BOOLEAN RingAbortPending;
++    BOOLEAN ExecutionStarted, RingIsFlush, RingAccepted;
+ } SPD_SRB_EXTENSION;
+ #define SpdSrbExtension(Srb)            ((SPD_SRB_EXTENSION *)SrbGetMiniportContext(Srb))
+ 
+@@ -454,6 +490,9 @@ typedef struct
+     KSPIN_LOCK Lock;
+     PVOID volatile WaitIrp;
+     PVOID ProducerWorker;
++    /* A device work item hands off retries while Storport still owns Worker. */
++    PIO_WORKITEM ProducerRetryWorker;
++    BOOLEAN ProducerRetryQueued;
+     SPD_SRB_EXTENSION **ProducerClaims;
+     PVOID *ProducerAbortedSrbs;
+     volatile LONG ProducerState;
+@@ -483,6 +522,7 @@ typedef struct
+     volatile LONG64 WaitCompletions;
+     volatile LONG64 ProducerWorkerRuns;
+     volatile LONG64 ProducerWorkerReruns;
++    volatile LONG64 ProducerBusyDeferrals;
+     volatile LONG64 ProducerProduced;
+     volatile LONG64 ProducerBatchLe1;
+     volatile LONG64 ProducerBatch2To4;
+diff --git a/src/sys/io.c b/src/sys/io.c
+index 1ce39bc..49a4120 100644
+--- a/src/sys/io.c
++++ b/src/sys/io.c
+@@ -165,14 +165,14 @@ UCHAR SpdSrbResetLogicalUnit(PVOID DeviceExtension, PVOID Srb)
+ 
+ UCHAR SpdSrbFlush(PVOID DeviceExtension, PVOID Srb)
+ {
+-    /* must have already received SYNCHRONIZE CACHE; just return SUCCESS */
+-    return SRB_STATUS_SUCCESS;
++    return SpdSrbPostFlush(DeviceExtension, Srb);
+ }
+ 
+ UCHAR SpdSrbShutdown(PVOID DeviceExtension, PVOID Srb)
+ {
+-    /* our user mode process must be gone; just return SUCCESS */
+-    return SRB_STATUS_SUCCESS;
++    /* SHUTDOWN can arrive more than once while I/O is still active. It must
++     * execute its own ordered backend flush rather than assume an earlier one. */
++    return SpdSrbPostFlush(DeviceExtension, Srb);
+ }
+ 
+ UCHAR SpdSrbPnp(PVOID DeviceExtension, PVOID Srb)
+diff --git a/src/sys/ioq.c b/src/sys/ioq.c
+index bfa95dc..3576a59 100644
+--- a/src/sys/ioq.c
++++ b/src/sys/ioq.c
+@@ -21,6 +21,35 @@
+ 
+ #include <sys/driver.h>
+ 
++/* Correctness-only backport: FIFO FLUSH fence in the original ownership model. */
++static VOID SpdIoqRetireLogicalNoLock(SPD_IOQ *Ioq, SPD_SRB_EXTENSION *Extension)
++{
++    if (Extension->RingAccepted)
++    {
++        Ioq->RetiredSrbs++;
++        Extension->RingAccepted = FALSE;
++    }
++    if (!Extension->ExecutionStarted)
++        return;
++    if (Extension->RingIsFlush)
++        Ioq->FlushInProgress = FALSE;
++    else
++    {
++        ASSERT(0 != Ioq->ActiveSrbs);
++        Ioq->ActiveSrbs--;
++    }
++    Extension->ExecutionStarted = FALSE;
++}
++
++static BOOLEAN SpdIoqEligibleNoLock(SPD_IOQ *Ioq)
++{
++    if (Ioq->Stopped || Ioq->FlushInProgress || IsListEmpty(&Ioq->PendingList))
++        return FALSE;
++    SPD_SRB_EXTENSION *Head = CONTAINING_RECORD(Ioq->PendingList.Flink,
++        SPD_SRB_EXTENSION, ListEntry);
++    return !Head->RingIsFlush || 0 == Ioq->ActiveSrbs;
++}
++
+ static VOID SpdIoqAcquireSpinLock(
+     SPD_IOQ *Ioq, KIRQL *PIrql, LARGE_INTEGER *PStart)
+ {
+@@ -32,6 +61,7 @@ static VOID SpdIoqAcquireSpinLock(
+     InterlockedExchangeAdd64(&Ioq->SpinLockWaitTicks,
+         After.QuadPart - Before.QuadPart);
+     InterlockedIncrement64(&Ioq->SpinLockAcquisitions);
++    SpdHistogramRecord(&Ioq->SpinLockWaitHistogram, After.QuadPart - Before.QuadPart);
+     *PStart = After;
+ }
+ 
+@@ -41,6 +71,7 @@ static VOID SpdIoqReleaseSpinLock(
+     LARGE_INTEGER End = KeQueryPerformanceCounter(0);
+     InterlockedExchangeAdd64(&Ioq->SpinLockHoldTicks,
+         End.QuadPart - Start.QuadPart);
++    SpdHistogramRecord(&Ioq->SpinLockHoldHistogram, End.QuadPart - Start.QuadPart);
+     KeReleaseSpinLock(&Ioq->SpinLock, Irql);
+ }
+ 
+@@ -120,6 +151,11 @@ VOID SpdIoqLogDiagnostics(SPD_IOQ *Ioq)
+         InterlockedCompareExchange64(&Ioq->SpinLockWaitTicks, 0, 0),
+         InterlockedCompareExchange64(&Ioq->SpinLockHoldTicks, 0, 0),
+         Frequency.QuadPart);
++    DbgPrint(DRIVER_NAME ": IOQ logical accepted=%I64u retired=%I64u active=%lu fence=%u lock_acquisitions=%I64d\n",
++        Ioq->AcceptedSrbs, Ioq->RetiredSrbs, Ioq->ActiveSrbs,
++        (unsigned)Ioq->FlushInProgress, Ioq->SpinLockAcquisitions);
++    SpdHistogramLog(&Ioq->SpinLockWaitHistogram, "lock_wait");
++    SpdHistogramLog(&Ioq->SpinLockHoldHistogram, "lock_hold");
+ }
+ 
+ static const char *SpdIoqResetReasonString(
+@@ -144,12 +180,22 @@ VOID SpdIoqReset(SPD_IOQ *Ioq, BOOLEAN Stop,
+ {
+     KIRQL Irql;
+     LARGE_INTEGER LockStart;
++    LIST_ENTRY RetiredList;
++    BOOLEAN TerminalReset;
+ #if defined(WINSPD_TEST_BUILD)
+     SPD_STORAGE_UNIT *TestStorageUnit = 0;
+ #endif
+ 
++    InitializeListHead(&RetiredList);
+     SpdIoqAcquireSpinLock(Ioq, &Irql, &LockStart);
+ 
++    TerminalReset = Ioq->NonblockingConsumer &&
++        (SpdIoqResetReasonBusReset == Reason ||
++         SpdIoqResetReasonDeviceReset == Reason ||
++         SpdIoqResetReasonLuReset == Reason);
++    if (TerminalReset)
++        Stop = TRUE;
++
+     if (Stop)
+     {
+         Ioq->Stopped = TRUE;
+@@ -178,11 +224,9 @@ VOID SpdIoqReset(SPD_IOQ *Ioq, BOOLEAN Stop,
+             SPD_SRB_EXTENSION *SrbExtension = CONTAINING_RECORD(
+                 PendingEntry, SPD_SRB_EXTENSION, ListEntry);
+             PVOID Srb = SrbExtension->Srb;
+-            SrbExtension->ListEntry.Flink =
+-                SrbExtension->ListEntry.Blink = 0;
+-            SrbExtension->RingState = SpdRingSrbNone;
++            SrbExtension->RingState = SpdRingSrbRetiring;
+             SrbExtension->RingAbortPending = FALSE;
+-            SrbExtension->Srb = 0;
++            InsertTailList(&RetiredList, &SrbExtension->ListEntry);
+ #if defined(WINSPD_TEST_BUILD)
+             if (0 == TestStorageUnit &&
+                 0 != SrbExtension->StorageUnit &&
+@@ -194,10 +238,6 @@ VOID SpdIoqReset(SPD_IOQ *Ioq, BOOLEAN Stop,
+             DbgPrint(DRIVER_NAME ": IOQ RESET reason=%s pending ext=%p srb=%p aborted\n",
+                 SpdIoqResetReasonString(Reason), SrbExtension,
+                 Srb);
+-            SpdSrbComplete(
+-                Ioq->DeviceExtension,
+-                Srb,
+-                SRB_STATUS_ABORTED);
+         }
+ 
+         PLIST_ENTRY ProcessEntry = Ioq->ProcessList.Flink;
+@@ -217,12 +257,10 @@ VOID SpdIoqReset(SPD_IOQ *Ioq, BOOLEAN Stop,
+ 
+             SpdIoqRemoveProcessHashNoLock(Ioq, SrbExtension);
+             RemoveEntryList(&SrbExtension->ListEntry);
+-            SrbExtension->ListEntry.Flink =
+-                SrbExtension->ListEntry.Blink = 0;
+-            SrbExtension->RingState = SpdRingSrbNone;
++            SrbExtension->RingState = SpdRingSrbRetiring;
+             SrbExtension->RingAbortPending = FALSE;
+             PVOID Srb = SrbExtension->Srb;
+-            SrbExtension->Srb = 0;
++            InsertTailList(&RetiredList, &SrbExtension->ListEntry);
+ #if defined(WINSPD_TEST_BUILD)
+             if (0 == TestStorageUnit &&
+                 0 != SrbExtension->StorageUnit &&
+@@ -234,15 +272,36 @@ VOID SpdIoqReset(SPD_IOQ *Ioq, BOOLEAN Stop,
+             DbgPrint(DRIVER_NAME ": IOQ RESET reason=%s process ext=%p srb=%p aborted\n",
+                 SpdIoqResetReasonString(Reason), SrbExtension,
+                 Srb);
+-            SpdSrbComplete(
+-                Ioq->DeviceExtension,
+-                Srb,
+-                SRB_STATUS_ABORTED);
+             ProcessEntry = NextEntry;
+         }
+     }
+ 
+     SpdIoqReleaseSpinLock(Ioq, Irql, LockStart);
++    if (TerminalReset)
++        SpdStorageUnitRingTerminalReset(Ioq->StorageUnit);
++    /* The detached list owns these SRBs. Finish metadata in bounded groups,
++     * then notify Storport with no IOQ lock held. New arrivals and another
++     * reset cannot attach to, retire, or reinitialize this private list. */
++    while (!IsListEmpty(&RetiredList))
++    {
++        PVOID Srbs[32];
++        ULONG Count = 0;
++        SpdIoqAcquireSpinLock(Ioq, &Irql, &LockStart);
++        while (Count < RTL_NUMBER_OF(Srbs) && !IsListEmpty(&RetiredList))
++        {
++            SPD_SRB_EXTENSION *Extension = CONTAINING_RECORD(
++                RemoveHeadList(&RetiredList), SPD_SRB_EXTENSION, ListEntry);
++            ASSERT(SpdRingSrbRetiring == Extension->RingState);
++            Srbs[Count++] = Extension->Srb;
++            SpdIoqRetireLogicalNoLock(Ioq, Extension);
++            Extension->Srb = 0;
++            Extension->ListEntry.Flink = Extension->ListEntry.Blink = 0;
++            Extension->RingState = SpdRingSrbNone;
++        }
++        SpdIoqReleaseSpinLock(Ioq, Irql, LockStart);
++        for (ULONG I = 0; I < Count; I++)
++            SpdSrbComplete(Ioq->DeviceExtension, Srbs[I], SRB_STATUS_ABORTED);
++    }
+ #if defined(WINSPD_TEST_BUILD)
+     if (0 != TestStorageUnit)
+         SpdStorageUnitRingTestIoqResetComplete(TestStorageUnit);
+@@ -264,13 +323,13 @@ BOOLEAN SpdIoqStopped(SPD_IOQ *Ioq)
+     return Result;
+ }
+ 
+-NTSTATUS SpdIoqCancelSrb(SPD_IOQ *Ioq, PVOID Srb)
++/* The caller owns the metadata lock and completes any detached SRB after
++ * unlocking. Worker-owned requests only receive a cancellation flag. */
++static NTSTATUS SpdIoqCancelSrbNoLock(SPD_IOQ *Ioq, PVOID Srb,
++    PVOID *PCompleteSrb)
+ {
+     NTSTATUS Result = STATUS_NOT_FOUND;
+-    KIRQL Irql;
+-    LARGE_INTEGER LockStart;
+-
+-    SpdIoqAcquireSpinLock(Ioq, &Irql, &LockStart);
++    *PCompleteSrb = 0;
+ 
+     if (!Ioq->Stopped)
+     {
+@@ -285,6 +344,13 @@ NTSTATUS SpdIoqCancelSrb(SPD_IOQ *Ioq, PVOID Srb)
+             0 != SrbExtension->ListEntry.Flink &&
+             0 != SrbExtension->ListEntry.Blink)
+         {
++            if (SpdRingSrbInFlight == SrbExtension->RingState)
++            {
++                /* Publication cannot be undone by an ordinary abort: the
++                 * backend may still be executing against the shared buffer. */
++                Result = STATUS_NOT_SUPPORTED;
++                goto exit;
++            }
+             if (SpdRingSrbPreparing == SrbExtension->RingState ||
+                 SpdRingSrbCompleting == SrbExtension->RingState)
+             {
+@@ -326,9 +392,9 @@ NTSTATUS SpdIoqCancelSrb(SPD_IOQ *Ioq, PVOID Srb)
+                     SrbExtension->ListEntry.Blink = 0;
+                 SrbExtension->RingState = SpdRingSrbNone;
+                 SrbExtension->RingAbortPending = FALSE;
++                SpdIoqRetireLogicalNoLock(Ioq, SrbExtension);
+                 SrbExtension->Srb = 0;
+-                SpdSrbComplete(Ioq->DeviceExtension, Srb,
+-                    SRB_STATUS_ABORTED);
++                *PCompleteSrb = Srb;
+                 Result = STATUS_SUCCESS;
+             }
+             else
+@@ -344,10 +410,60 @@ NTSTATUS SpdIoqCancelSrb(SPD_IOQ *Ioq, PVOID Srb)
+             Srb);
+ 
+ exit:
++    return Result;
++}
++
++NTSTATUS SpdIoqCancelSrb(SPD_IOQ *Ioq, PVOID Srb)
++{
++    KIRQL Irql;
++    LARGE_INTEGER LockStart;
++    PVOID CompleteSrb;
++    NTSTATUS Result;
++    SpdIoqAcquireSpinLock(Ioq, &Irql, &LockStart);
++    Result = SpdIoqCancelSrbNoLock(Ioq, Srb, &CompleteSrb);
+     SpdIoqReleaseSpinLock(Ioq, Irql, LockStart);
++    if (0 != CompleteSrb)
++        SpdSrbComplete(Ioq->DeviceExtension, CompleteSrb, SRB_STATUS_ABORTED);
++    if (NT_SUCCESS(Result) && Ioq->NonblockingConsumer)
++        SpdStorageUnitRingScheduleProducer(Ioq->StorageUnit);
++    return Result;
++}
+ 
++#if defined(WINSPD_TEST_BUILD)
++NTSTATUS SpdIoqTestCancel(SPD_IOQ *Ioq, UINT32 Kind,
++    UINT64 BlockAddress, UINT32 ExpectedState)
++{
++    KIRQL Irql;
++    LARGE_INTEGER LockStart;
++    PVOID CompleteSrb = 0;
++    NTSTATUS Result = STATUS_NOT_FOUND;
++    SpdIoqAcquireSpinLock(Ioq, &Irql, &LockStart);
++    if (!Ioq->Stopped && Ioq->NonblockingConsumer)
++        for (PLIST_ENTRY Entry = Ioq->ProcessList.Flink;
++            Entry != &Ioq->ProcessList; Entry = Entry->Flink)
++        {
++            SPD_SRB_EXTENSION *Extension = CONTAINING_RECORD(
++                Entry, SPD_SRB_EXTENSION, ListEntry);
++            BOOLEAN Expected =
++                (SPD_TEST_CANCEL_PREPARING == ExpectedState &&
++                    SpdRingSrbPreparing == Extension->RingState) ||
++                (SPD_TEST_CANCEL_COMPLETING == ExpectedState &&
++                    SpdRingSrbCompleting == Extension->RingState) ||
++                (SPD_TEST_CANCEL_INFLIGHT == ExpectedState &&
++                    SpdRingSrbInFlight == Extension->RingState);
++            if (Expected && 0 != Extension->Srb &&
++                SpdSrbTestMatchesRange(Extension->Srb, Kind, BlockAddress))
++            {
++                Result = SpdIoqCancelSrbNoLock(Ioq, Extension->Srb,
++                    &CompleteSrb);
++                break;
++            }
++        }
++    SpdIoqReleaseSpinLock(Ioq, Irql, LockStart);
++    ASSERT(0 == CompleteSrb); /* Selected states cannot be retired by abort. */
+     return Result;
+ }
++#endif
+ 
+ NTSTATUS SpdIoqPostSrb(SPD_STORAGE_UNIT *StorageUnit, PVOID Srb)
+ {
+@@ -365,6 +481,11 @@ NTSTATUS SpdIoqPostSrb(SPD_STORAGE_UNIT *StorageUnit, PVOID Srb)
+ 
+         ASSERT(0 == SrbExtension->Srb);
+         SrbExtension->Srb = Srb;
++        SrbExtension->RingAccepted = Ioq->NonblockingConsumer;
++        if (SrbExtension->RingAccepted)
++            Ioq->AcceptedSrbs++;
++        SrbExtension->RingIsFlush = SpdSrbIsFlush(Srb);
++        ASSERT(!SrbExtension->ExecutionStarted);
+         SrbExtension->RingState = Ioq->NonblockingConsumer ?
+             SpdRingSrbPending : SpdRingSrbNone;
+         SrbExtension->RingAbortPending = FALSE;
+@@ -403,7 +524,7 @@ NTSTATUS SpdIoqRingClaimSrb(
+     SpdIoqAcquireSpinLock(Ioq, &Irql, &LockStart);
+     if (Ioq->Stopped)
+         Result = STATUS_CANCELLED;
+-    else if (IsListEmpty(&Ioq->PendingList))
++    else if (!SpdIoqEligibleNoLock(Ioq))
+         Result = STATUS_NOT_FOUND;
+     else
+     {
+@@ -422,6 +543,14 @@ NTSTATUS SpdIoqRingClaimSrb(
+ #endif
+         SrbExtension->HashNext = Ioq->ProcessBuckets[Index];
+         Ioq->ProcessBuckets[Index] = SrbExtension;
++        if (!SrbExtension->ExecutionStarted)
++        {
++            if (SrbExtension->RingIsFlush)
++                Ioq->FlushInProgress = TRUE;
++            else
++                Ioq->ActiveSrbs++;
++            SrbExtension->ExecutionStarted = TRUE;
++        }
+         SrbExtension->RingState = SpdRingSrbPreparing;
+         SrbExtension->RingAbortPending = FALSE;
+         *PSrbExtension = SrbExtension;
+@@ -463,6 +592,7 @@ BOOLEAN SpdIoqRingCommitPreparedSrbNoLock(
+         SrbExtension->ListEntry.Flink =
+             SrbExtension->ListEntry.Blink = 0;
+         *PSrb = SrbExtension->Srb;
++        SpdIoqRetireLogicalNoLock(Ioq, SrbExtension);
+         SrbExtension->Srb = 0;
+         SrbExtension->RingState = SpdRingSrbNone;
+         SrbExtension->RingAbortPending = FALSE;
+@@ -528,6 +658,7 @@ NTSTATUS SpdIoqRingFinishCompletion(
+     {
+         SrbStatus = SRB_STATUS_ABORTED;
+         Srb = SrbExtension->Srb;
++        SpdIoqRetireLogicalNoLock(Ioq, SrbExtension);
+         SrbExtension->Srb = 0;
+         SrbExtension->RingState = SpdRingSrbNone;
+         SrbExtension->RingAbortPending = FALSE;
+@@ -545,6 +676,7 @@ NTSTATUS SpdIoqRingFinishCompletion(
+     else
+     {
+         Srb = SrbExtension->Srb;
++        SpdIoqRetireLogicalNoLock(Ioq, SrbExtension);
+         SrbExtension->Srb = 0;
+         SrbExtension->RingState = SpdRingSrbNone;
+         SrbExtension->RingAbortPending = FALSE;
+@@ -584,7 +716,7 @@ BOOLEAN SpdIoqRingHasPending(SPD_IOQ *Ioq)
+     LARGE_INTEGER LockStart;
+ 
+     SpdIoqAcquireSpinLock(Ioq, &Irql, &LockStart);
+-    HasPending = !Ioq->Stopped && !IsListEmpty(&Ioq->PendingList);
++    HasPending = SpdIoqEligibleNoLock(Ioq);
+     SpdIoqReleaseSpinLock(Ioq, Irql, LockStart);
+     return HasPending;
+ }
+@@ -720,6 +852,8 @@ NTSTATUS SpdIoqEndProcessingSrbByExtension(SPD_IOQ *Ioq,
+     NTSTATUS Result;
+     KIRQL Irql;
+     LARGE_INTEGER LockStart;
++    PVOID CompleteSrb = 0;
++    UCHAR CompleteStatus = SRB_STATUS_SUCCESS;
+ 
+     SpdIoqAcquireSpinLock(Ioq, &Irql, &LockStart);
+ 
+@@ -734,6 +868,7 @@ NTSTATUS SpdIoqEndProcessingSrbByExtension(SPD_IOQ *Ioq,
+             if (*P == SrbExtension)
+             {
+                 *P = SrbExtension->HashNext;
++                SrbExtension->HashNext = 0;
+                 RemoveEntryList(&SrbExtension->ListEntry);
+ 
+                 UCHAR SrbStatus = Complete(SrbExtension, Context, DataBuffer);
+@@ -756,7 +891,15 @@ NTSTATUS SpdIoqEndProcessingSrbByExtension(SPD_IOQ *Ioq,
+                         SpdQeventSetNoLock(&Ioq->PendingEvent);
+                 }
+                 else
+-                    SpdSrbComplete(Ioq->DeviceExtension, SrbExtension->Srb, SrbStatus);
++                {
++                    CompleteSrb = SrbExtension->Srb;
++                    CompleteStatus = SrbStatus;
++                    SpdIoqRetireLogicalNoLock(Ioq, SrbExtension);
++                    SrbExtension->Srb = 0;
++                    SrbExtension->ListEntry.Flink =
++                        SrbExtension->ListEntry.Blink = 0;
++                    SrbExtension->RingState = SpdRingSrbNone;
++                }
+ 
+                 Result = STATUS_SUCCESS;
+                 break;
+@@ -786,6 +929,9 @@ NTSTATUS SpdIoqEndProcessingSrbByExtension(SPD_IOQ *Ioq,
+ 
+     SpdIoqReleaseSpinLock(Ioq, Irql, LockStart);
+ 
++    if (0 != CompleteSrb)
++        SpdSrbComplete(Ioq->DeviceExtension, CompleteSrb, CompleteStatus);
++
+     return Result;
+ }
+ 
+diff --git a/src/sys/scsi.c b/src/sys/scsi.c
+index c03ddf9..754ad5e 100644
+--- a/src/sys/scsi.c
++++ b/src/sys/scsi.c
+@@ -43,6 +43,82 @@ static UCHAR SpdScsiErrorEx(PVOID Srb,
+ static VOID SpdCdbGetRange(PCDB Cdb,
+     PUINT64 POffset, PUINT32 PLength, PUINT32 PForceUnitAccess);
+ 
++BOOLEAN SpdSrbIsFlush(PVOID Srb)
++{
++    ULONG Function = SrbGetSrbFunction(Srb);
++    if (SRB_FUNCTION_FLUSH == Function || SRB_FUNCTION_SHUTDOWN == Function)
++        return TRUE;
++    if (SRB_FUNCTION_EXECUTE_SCSI != Function)
++        return FALSE;
++    UCHAR Operation = SrbGetCdb(Srb)->AsByte[0];
++    return SCSIOP_SYNCHRONIZE_CACHE == Operation || SCSIOP_SYNCHRONIZE_CACHE16 == Operation;
++}
++
++UCHAR SpdSrbPostFlush(PVOID DeviceExtension, PVOID Srb)
++{
++    SPD_STORAGE_UNIT *StorageUnit = SpdStorageUnitReference(DeviceExtension, Srb);
++    if (0 == StorageUnit)
++        return SRB_STATUS_NO_DEVICE;
++    UCHAR Status = SpdScsiPostSrb(DeviceExtension, StorageUnit, Srb, 0);
++    SpdStorageUnitDereference(DeviceExtension, StorageUnit);
++    return Status;
++}
++
++#if defined(WINSPD_TEST_BUILD)
++BOOLEAN SpdSrbTestMatchesRange(PVOID Srb, UINT32 Kind, UINT64 BlockAddress)
++{
++    UINT64 Address;
++    UINT32 ActualKind;
++    PCDB Cdb;
++    if (SRB_FUNCTION_EXECUTE_SCSI != SrbGetSrbFunction(Srb))
++        return FALSE;
++    Cdb = SrbGetCdb(Srb);
++    switch (Cdb->AsByte[0])
++    {
++    case SCSIOP_READ6: case SCSIOP_READ: case SCSIOP_READ12: case SCSIOP_READ16:
++        ActualKind = SpdIoctlTransactReadKind;
++        break;
++    case SCSIOP_WRITE6: case SCSIOP_WRITE: case SCSIOP_WRITE12: case SCSIOP_WRITE16:
++        ActualKind = SpdIoctlTransactWriteKind;
++        break;
++    case SCSIOP_SYNCHRONIZE_CACHE: case SCSIOP_SYNCHRONIZE_CACHE16:
++        ActualKind = SpdIoctlTransactFlushKind;
++        break;
++    default:
++        return FALSE;
++    }
++    SpdCdbGetRange(Cdb, &Address, 0, 0);
++    return ActualKind == Kind && Address == BlockAddress;
++}
++/* Pure preparation/completion checks: these local SRBs are never queued or
++ * submitted to Storport notification, and deliberately contain no valid CDB. */
++NTSTATUS SpdSrbTestNonCdbHelpers(SPD_STORAGE_UNIT *StorageUnit)
++{
++    for (UINT32 I = 0; I < 2; I++)
++    {
++        SCSI_REQUEST_BLOCK Srb = { 0 };
++        SPD_SRB_EXTENSION Extension = { 0 };
++        SPD_IOCTL_TRANSACT_REQ Request = { 0 };
++        SPD_IOCTL_TRANSACT_RSP Response = { 0 };
++        Srb.Length = sizeof Srb;
++        Srb.Function = 0 == I ? SRB_FUNCTION_FLUSH : SRB_FUNCTION_SHUTDOWN;
++        Extension.Srb = &Srb;
++        Extension.StorageUnit = StorageUnit;
++        if (!SpdSrbIsFlush(&Srb) || 0 != SpdSrbPreparationCopyBytes(&Extension))
++            return STATUS_DATA_ERROR;
++        SpdSrbExecuteScsiPrepare(&Extension, &Request, 0);
++        if (SpdIoctlTransactFlushKind != Request.Kind || 0 == Request.Hint ||
++            0 != Request.Op.Flush.BlockAddress || 0 != Request.Op.Flush.BlockCount ||
++            SRB_STATUS_SUCCESS != SpdSrbExecuteScsiComplete(&Extension, &Response, 0))
++            return STATUS_DATA_ERROR;
++        Response.Status.ScsiStatus = SCSISTAT_CHECK_CONDITION;
++        if (SRB_STATUS_ERROR != SpdSrbExecuteScsiComplete(&Extension, &Response, 0))
++            return STATUS_DATA_ERROR;
++    }
++    return STATUS_SUCCESS;
++}
++#endif
++
+ #define SpdScsiError(S,K,A)             SpdScsiErrorEx(S,K,A,0,0)
+ 
+ UCHAR SpdSrbExecuteScsi(PVOID DeviceExtension, PVOID Srb)
+@@ -582,6 +658,7 @@ static UCHAR SpdScsiPostRangeSrb(PVOID DeviceExtension, SPD_STORAGE_UNIT *Storag
+     UINT64 BlockAddress, EndBlockAddress;
+     UINT32 BlockCount;
+     ULONG DataLength;
++    BOOLEAN Flush = FALSE;
+ 
+     switch (Cdb->AsByte[0])
+     {
+@@ -615,6 +692,7 @@ static UCHAR SpdScsiPostRangeSrb(PVOID DeviceExtension, SPD_STORAGE_UNIT *Storag
+             return SpdScsiError(Srb, SCSI_SENSE_DATA_PROTECT, SCSI_ADSENSE_WRITE_PROTECT);
+         SpdCdbGetRange(Cdb, &BlockAddress, &BlockCount, 0);
+         DataLength = 0;
++        Flush = TRUE;
+         break;
+ 
+     default:
+@@ -622,11 +700,15 @@ static UCHAR SpdScsiPostRangeSrb(PVOID DeviceExtension, SPD_STORAGE_UNIT *Storag
+         return SRB_STATUS_INVALID_REQUEST;
+     }
+ 
+-    if (0 == BlockCount)
++    if (!Flush && 0 == BlockCount)
+         return SRB_STATUS_SUCCESS;
+ 
++    /* A zero-count SYNCHRONIZE CACHE covers LBA through the end of the
++     * medium; it is not an empty transfer. Preserve the zero count in the
++     * backend request rather than expanding it into a possibly >32-bit range. */
+     EndBlockAddress = BlockAddress + BlockCount;
+-    if (EndBlockAddress < BlockAddress ||
++    if ((Flush && BlockAddress >= StorageUnit->StorageUnitParams.BlockCount) ||
++        EndBlockAddress < BlockAddress ||
+         EndBlockAddress > StorageUnit->StorageUnitParams.BlockCount)
+         return SpdScsiError(Srb, SCSI_SENSE_ILLEGAL_REQUEST, SCSI_ADSENSE_ILLEGAL_BLOCK);
+ 
+@@ -713,6 +795,17 @@ static UCHAR SpdScsiPostSrb(PVOID DeviceExtension, SPD_STORAGE_UNIT *StorageUnit
+     return NT_SUCCESS(Result) ? SRB_STATUS_PENDING : SRB_STATUS_ABORTED;
+ }
+ 
++static ULONG SpdSrbChunkLength(SPD_SRB_EXTENSION *Extension)
++{
++    ULONG Length = min(Extension->SystemDataLength - Extension->ChunkOffset,
++        Extension->StorageUnit->StorageUnitParams.MaxTransferLength);
++#if defined(WINSPD_TEST_BUILD)
++    if (0 != Extension->StorageUnit->TestChunkLimit)
++        Length = min(Length, Extension->StorageUnit->TestChunkLimit);
++#endif
++    return Length;
++}
++
+ VOID SpdSrbExecuteScsiPrepare(PVOID SrbExtension0, PVOID Context, PVOID DataBuffer)
+ {
+     ASSERT(DISPATCH_LEVEL >= KeGetCurrentIrql());
+@@ -725,6 +818,15 @@ VOID SpdSrbExecuteScsiPrepare(PVOID SrbExtension0, PVOID Context, PVOID DataBuff
+     UINT32 ForceUnitAccess;
+     ULONG ChunkLength;
+ 
++    if (SRB_FUNCTION_FLUSH == SrbGetSrbFunction(Srb) ||
++        SRB_FUNCTION_SHUTDOWN == SrbGetSrbFunction(Srb))
++    {
++        Req->Hint = (UINT64)(UINT_PTR)SrbExtension;
++        Req->Kind = SpdIoctlTransactFlushKind;
++        Req->Op.Flush.BlockAddress = 0;
++        Req->Op.Flush.BlockCount = 0;
++        return;
++    }
+     Cdb = SrbGetCdb(Srb);
+     switch (Cdb->AsByte[0])
+     {
+@@ -740,9 +842,7 @@ VOID SpdSrbExecuteScsiPrepare(PVOID SrbExtension0, PVOID Context, PVOID DataBuff
+             &ForceUnitAccess);
+         Req->Op.Read.ForceUnitAccess =
+             StorageUnit->StorageUnitParams.CacheSupported ? ForceUnitAccess : 1;
+-        ChunkLength = SrbExtension->SystemDataLength - SrbExtension->ChunkOffset;
+-        if (ChunkLength > StorageUnit->StorageUnitParams.MaxTransferLength)
+-            ChunkLength = StorageUnit->StorageUnitParams.MaxTransferLength;
++        ChunkLength = SpdSrbChunkLength(SrbExtension);
+         Req->Op.Read.BlockAddress +=
+             SrbExtension->ChunkOffset / StorageUnit->StorageUnitParams.BlockLength;
+         Req->Op.Read.BlockCount =
+@@ -763,9 +863,7 @@ VOID SpdSrbExecuteScsiPrepare(PVOID SrbExtension0, PVOID Context, PVOID DataBuff
+             StorageUnit->StorageUnitParams.CacheSupported &&
+             StorageUnit->StorageUnitParams.FuaSupported ? ForceUnitAccess :
+             !StorageUnit->StorageUnitParams.CacheSupported;
+-        ChunkLength = SrbExtension->SystemDataLength - SrbExtension->ChunkOffset;
+-        if (ChunkLength > StorageUnit->StorageUnitParams.MaxTransferLength)
+-            ChunkLength = StorageUnit->StorageUnitParams.MaxTransferLength;
++        ChunkLength = SpdSrbChunkLength(SrbExtension);
+         Req->Op.Write.BlockAddress +=
+             SrbExtension->ChunkOffset / StorageUnit->StorageUnitParams.BlockLength;
+         Req->Op.Write.BlockCount =
+@@ -822,12 +920,16 @@ UCHAR SpdSrbExecuteScsiComplete(PVOID SrbExtension0, PVOID Context, PVOID DataBu
+     ASSERT(DISPATCH_LEVEL >= KeGetCurrentIrql());
+ 
+     SPD_SRB_EXTENSION *SrbExtension = SrbExtension0;
+-    SPD_STORAGE_UNIT *StorageUnit = SrbExtension->StorageUnit;
+     SPD_IOCTL_TRANSACT_RSP *Rsp = Context;
+     PVOID Srb = SrbExtension->Srb;
+     PCDB Cdb;
+     ULONG ChunkLength;
+ 
++    /* Non-CDB SRBs have no valid CDB or execute-SCSI sense extension. */
++    if (SRB_FUNCTION_FLUSH == SrbGetSrbFunction(Srb) ||
++        SRB_FUNCTION_SHUTDOWN == SrbGetSrbFunction(Srb))
++        return SCSISTAT_GOOD == Rsp->Status.ScsiStatus ? SRB_STATUS_SUCCESS : SRB_STATUS_ERROR;
++
+     if (SCSISTAT_GOOD != Rsp->Status.ScsiStatus)
+         return SpdScsiErrorEx(Srb,
+             Rsp->Status.SenseKey,
+@@ -842,10 +944,8 @@ UCHAR SpdSrbExecuteScsiComplete(PVOID SrbExtension0, PVOID Context, PVOID DataBu
+     case SCSIOP_READ:
+     case SCSIOP_READ12:
+     case SCSIOP_READ16:
+-        ChunkLength = SrbExtension->SystemDataLength - SrbExtension->ChunkOffset;
+-        if (ChunkLength > StorageUnit->StorageUnitParams.MaxTransferLength)
+-            ChunkLength = StorageUnit->StorageUnitParams.MaxTransferLength;
+-        SpdStorageUnitRingTestCompletionCopyBarrier(StorageUnit);
++        ChunkLength = SpdSrbChunkLength(SrbExtension);
++        SpdStorageUnitRingTestCompletionCopyBarrier(SrbExtension->StorageUnit);
+         if (0 != DataBuffer)
+             RtlCopyMemory((PUINT8)SrbExtension->SystemDataBuffer + SrbExtension->ChunkOffset,
+                 DataBuffer, ChunkLength);
+@@ -861,9 +961,7 @@ UCHAR SpdSrbExecuteScsiComplete(PVOID SrbExtension0, PVOID Context, PVOID DataBu
+     case SCSIOP_WRITE:
+     case SCSIOP_WRITE12:
+     case SCSIOP_WRITE16:
+-        ChunkLength = SrbExtension->SystemDataLength - SrbExtension->ChunkOffset;
+-        if (ChunkLength > StorageUnit->StorageUnitParams.MaxTransferLength)
+-            ChunkLength = StorageUnit->StorageUnitParams.MaxTransferLength;
++        ChunkLength = SpdSrbChunkLength(SrbExtension);
+         SrbExtension->ChunkOffset += ChunkLength;
+         /* if we are done return SUCCESS; if we have more chunks return PENDING */
+         return SrbExtension->ChunkOffset >= SrbExtension->SystemDataLength ?
+diff --git a/src/sys/stgunit.c b/src/sys/stgunit.c
+index d0aef46..904399c 100644
+--- a/src/sys/stgunit.c
++++ b/src/sys/stgunit.c
+@@ -30,6 +30,8 @@ static VOID SpdStorageUnitRingProducerWorker(
+     PVOID HwDeviceExtension,
+     PVOID Context,
+     PVOID Worker);
++static IO_WORKITEM_ROUTINE SpdStorageUnitRingProducerRetryWorker;
++static ULONG SpdStorageUnitRingQueueProducerWorker(SPD_STORAGE_UNIT *StorageUnit);
+ static BOOLEAN SpdStorageUnitRingEnter(SPD_STORAGE_UNIT *StorageUnit);
+ static VOID SpdStorageUnitRingLeave(SPD_STORAGE_UNIT *StorageUnit);
+ static VOID SpdStorageUnitRingCompleteWait(
+@@ -37,6 +39,7 @@ static VOID SpdStorageUnitRingCompleteWait(
+     NTSTATUS Status,
+     BOOLEAN RequireRequest);
+ static VOID SpdStorageUnitRingCancelWait(SPD_STORAGE_UNIT *StorageUnit);
++static DRIVER_CANCEL SpdStorageUnitRingCancelWaitIrp;
+ 
+ #if defined(WINSPD_TEST_BUILD)
+ static PKEVENT SpdRingTestOpenEvent(PCWSTR Name)
+@@ -348,6 +351,7 @@ NTSTATUS SpdStorageUnitRingOpen(
+     SPD_SRB_EXTENSION **ProducerClaims = 0;
+     PVOID *ProducerAbortedSrbs = 0;
+     PVOID Worker = 0;
++    PIO_WORKITEM RetryWorker = 0;
+     KIRQL Irql;
+ #if defined(WINSPD_TEST_BUILD)
+     PKEVENT TestPostEnteredEvent = 0;
+@@ -579,6 +583,14 @@ NTSTATUS SpdStorageUnitRingOpen(
+         goto exit;
+     }
+ 
++    RetryWorker = IoAllocateWorkItem(
++        ((SPD_DEVICE_EXTENSION *)StorageUnit->Ioq->DeviceExtension)->DeviceObject);
++    if (0 == RetryWorker)
++    {
++        Result = STATUS_INSUFFICIENT_RESOURCES;
++        goto exit;
++    }
++
+     KeAcquireSpinLock(&Ring->Lock, &Irql);
+     if (ProcessId != StorageUnit->TransactProcessId)
+     {
+@@ -606,6 +618,8 @@ NTSTATUS SpdStorageUnitRingOpen(
+     Ring->Buffers.FreeCount = Params->BufferCount;
+     Ring->Buffers.Meta = Meta;
+     Ring->ProducerWorker = Worker;
++    Ring->ProducerRetryWorker = RetryWorker;
++    Ring->ProducerRetryQueued = FALSE;
+     Ring->ProducerClaims = ProducerClaims;
+     Ring->ProducerAbortedSrbs = ProducerAbortedSrbs;
+     Ring->SectionHandle = SectionHandle;
+@@ -642,6 +656,7 @@ NTSTATUS SpdStorageUnitRingOpen(
+     ProducerClaims = 0;
+     ProducerAbortedSrbs = 0;
+     Worker = 0;
++    RetryWorker = 0;
+ #if defined(WINSPD_TEST_BUILD)
+     TestPostEnteredEvent = 0;
+     TestPostReleaseEvent = 0;
+@@ -679,6 +694,8 @@ exit:
+             "open cleanup");
+         Worker = 0;
+     }
++    if (0 != RetryWorker)
++        IoFreeWorkItem(RetryWorker);
+     if (0 != Mdl)
+     {
+         if (PagesLocked)
+@@ -769,12 +786,13 @@ VOID SpdStorageUnitRingClose(
+ #endif
+     DbgPrint(DRIVER_NAME ": SharedRing close depth=%lu buffers=%lu "
+         "sq_full=%I64d buffer_starved=%I64d waits=%I64d/%I64d "
+-        "producer_runs=%I64d producer_reruns=%I64d "
++        "producer_runs=%I64d producer_reruns=%I64d busy_deferrals=%I64d "
+         "produced=%I64d batches=[%I64d,%I64d,%I64d,%I64d,%I64d] max_batch=%ld\n",
+         Ring->QueueDepth, Ring->BufferCount,
+         Ring->SqFullEvents, Ring->BufferPoolExhaustions,
+         Ring->WaitSubmissions, Ring->WaitCompletions,
+         Ring->ProducerWorkerRuns, Ring->ProducerWorkerReruns,
++        Ring->ProducerBusyDeferrals,
+         Ring->ProducerProduced, Ring->ProducerBatchLe1,
+         Ring->ProducerBatch2To4, Ring->ProducerBatch5To16,
+         Ring->ProducerBatch17To64, Ring->ProducerBatchOver64,
+@@ -799,6 +817,10 @@ VOID SpdStorageUnitRingClose(
+     KeAcquireSpinLock(&Ring->Lock, &Irql);
+     Ring->ProducerWorker = 0;
+     KeReleaseSpinLock(&Ring->Lock, Irql);
++    /* Retry callbacks are included in ActiveCalls/IdleEvent rundown. */
++    ASSERT(!Ring->ProducerRetryQueued);
++    IoFreeWorkItem(Ring->ProducerRetryWorker);
++    Ring->ProducerRetryWorker = 0;
+     SpdStorageUnitRingReset(StorageUnit, UserProcessExiting);
+ }
+ 
+@@ -1154,6 +1176,9 @@ static UINT32 SpdRingProduceBatch(
+         StagedCount++;
+ 
+         RtlZeroMemory(&Request, sizeof Request);
++        /* Pause at the claimed ownership boundary for all request kinds,
++         * including READs that have no preparation payload copy. */
++        SpdStorageUnitRingTestPrepareCopyBarrier(StorageUnit);
+         LARGE_INTEGER PrepareStart = KeQueryPerformanceCounter(0);
+         SpdSrbExecuteScsiPrepare(
+             SrbExtension, &Request, DataBuffer);
+@@ -1244,6 +1269,25 @@ static UINT32 SpdRingProduceBatch(
+     return Published;
+ }
+ 
++static VOID SpdStorageUnitRingCancelWaitIrp(PDEVICE_OBJECT DeviceObject, PIRP Irp)
++{
++    SPD_STORAGE_UNIT *StorageUnit = Irp->Tail.Overlay.DriverContext[0];
++    SPD_DEVICE_EXTENSION *DeviceExtension = StorageUnit->Ioq->DeviceExtension;
++    UNREFERENCED_PARAMETER(DeviceObject);
++
++    /* Registration and normal dequeue use the I/O cancel lock. The retained
++     * WAIT reference belongs to exactly one completion path. */
++    ASSERT(StorageUnit->Ring.WaitIrp == Irp);
++    StorageUnit->Ring.WaitIrp = 0;
++    IoReleaseCancelSpinLock(Irp->CancelIrql);
++    Irp->IoStatus.Status = STATUS_CANCELLED;
++    Irp->IoStatus.Information = 0;
++    InterlockedIncrement64(&StorageUnit->Ring.WaitCompletions);
++    StorPortCompleteServiceIrp(DeviceExtension, Irp);
++    SpdStorageUnitRingLeave(StorageUnit);
++    SpdStorageUnitDereference(DeviceExtension, StorageUnit);
++}
++
+ static VOID SpdStorageUnitRingCompleteWait(
+     SPD_STORAGE_UNIT *StorageUnit,
+     NTSTATUS Status,
+@@ -1277,7 +1321,18 @@ static VOID SpdStorageUnitRingCompleteWait(
+             Status = STATUS_SUCCESS;
+     }
+ 
+-    PIRP Irp = InterlockedExchangePointer(&Ring->WaitIrp, 0);
++    IoAcquireCancelSpinLock(&Irql);
++    PIRP Irp = Ring->WaitIrp;
++    if (0 != Irp)
++    {
++        Ring->WaitIrp = 0;
++        PDRIVER_CANCEL CancelRoutine = IoSetCancelRoutine(Irp, 0);
++        ASSERT(0 != CancelRoutine);
++        UNREFERENCED_PARAMETER(CancelRoutine);
++        if (Irp->Cancel)
++            Status = STATUS_CANCELLED;
++    }
++    IoReleaseCancelSpinLock(Irql);
+     if (0 == Irp)
+         return;
+ 
+@@ -1295,6 +1350,104 @@ static VOID SpdStorageUnitRingCancelWait(SPD_STORAGE_UNIT *StorageUnit)
+     SpdStorageUnitRingCompleteWait(StorageUnit, STATUS_CANCELLED, FALSE);
+ }
+ 
++/* ProducerState owns the producer reference. A retry has an additional
++ * callback reference, so a successfully queued producer cannot release the
++ * last reference while this scheduling callback is still accessing Ring. */
++static ULONG SpdStorageUnitRingQueueProducerWorker(SPD_STORAGE_UNIT *StorageUnit)
++{
++    SPD_RING_STATE *Ring = &StorageUnit->Ring;
++    SPD_DEVICE_EXTENSION *DeviceExtension = StorageUnit->Ioq->DeviceExtension;
++    ULONG Status = StorPortQueueWorkItem(DeviceExtension,
++        SpdStorageUnitRingProducerWorker, Ring->ProducerWorker, StorageUnit);
++    KIRQL Irql;
++
++    if (STOR_STATUS_BUSY != Status)
++        return Status;
++
++    SPD_STORAGE_UNIT *Reference = SpdStorageUnitReferenceByBtl(
++        DeviceExtension, StorageUnit->Btl);
++    if (Reference != StorageUnit)
++    {
++        if (0 != Reference)
++            SpdStorageUnitDereference(DeviceExtension, Reference);
++        return STOR_STATUS_INVALID_DEVICE_STATE;
++    }
++    if (!SpdStorageUnitRingEnter(StorageUnit))
++    {
++        SpdStorageUnitDereference(DeviceExtension, Reference);
++        return STOR_STATUS_INVALID_DEVICE_STATE;
++    }
++
++    KeAcquireSpinLock(&Ring->Lock, &Irql);
++    ASSERT(!Ring->ProducerRetryQueued);
++    Ring->ProducerRetryQueued = TRUE;
++    InterlockedIncrement64(&Ring->ProducerBusyDeferrals);
++    KeReleaseSpinLock(&Ring->Lock, Irql);
++
++    /* Unlike the Storport worker, an IO work item is dequeued before its
++     * callback starts and may be queued again from a running callback. */
++    IoQueueWorkItem(Ring->ProducerRetryWorker,
++        SpdStorageUnitRingProducerRetryWorker, DelayedWorkQueue, StorageUnit);
++    return STOR_STATUS_SUCCESS;
++}
++
++static VOID SpdStorageUnitRingProducerRetryWorker(
++    PDEVICE_OBJECT DeviceObject, PVOID Context)
++{
++    SPD_STORAGE_UNIT *StorageUnit = Context;
++    SPD_RING_STATE *Ring = &StorageUnit->Ring;
++    SPD_DEVICE_EXTENSION *DeviceExtension = StorageUnit->Ioq->DeviceExtension;
++    KIRQL Irql;
++    BOOLEAN Stopping;
++    ULONG Status;
++
++    ASSERT(PASSIVE_LEVEL == KeGetCurrentIrql());
++    ASSERT(DeviceObject == DeviceExtension->DeviceObject);
++    KeAcquireSpinLock(&Ring->Lock, &Irql);
++    ASSERT(Ring->ProducerRetryQueued);
++    Ring->ProducerRetryQueued = FALSE;
++    Stopping = Ring->Stopping || Ring->Failed;
++    KeReleaseSpinLock(&Ring->Lock, Irql);
++    Stopping = Stopping || SpdIoqStopped(StorageUnit->Ioq);
++
++    if (Stopping)
++        goto cancel;
++
++    Status = StorPortQueueWorkItem(DeviceExtension,
++        SpdStorageUnitRingProducerWorker, Ring->ProducerWorker, StorageUnit);
++    if (STOR_STATUS_SUCCESS == Status)
++        goto done;
++    if (STOR_STATUS_BUSY == Status)
++    {
++        /* One attempt per callback, with no busy-wait. The old Storport
++         * callback can finish independently; retain both references across
++         * this queued retry. This path does not retry SQ/slot exhaustion. */
++        KeAcquireSpinLock(&Ring->Lock, &Irql);
++        Stopping = Ring->Stopping || Ring->Failed;
++        if (!Stopping)
++        {
++            Ring->ProducerRetryQueued = TRUE;
++            InterlockedIncrement64(&Ring->ProducerBusyDeferrals);
++        }
++        KeReleaseSpinLock(&Ring->Lock, Irql);
++        if (Stopping)
++            goto cancel;
++        IoQueueWorkItem(Ring->ProducerRetryWorker,
++            SpdStorageUnitRingProducerRetryWorker, DelayedWorkQueue, StorageUnit);
++        return;
++    }
++
++    DbgPrint(DRIVER_NAME ": SharedRing producer retry queue failed status=%lu\n", Status);
++    SpdStorageUnitRingMarkFailed(StorageUnit);
++cancel:
++    InterlockedExchange(&Ring->ProducerState, SPD_RING_PRODUCER_IDLE);
++    SpdStorageUnitRingReleaseProducerReference(StorageUnit);
++done:
++    /* Release the retry callback's own reference after the producer handoff. */
++    SpdStorageUnitRingLeave(StorageUnit);
++    SpdStorageUnitDereference(DeviceExtension, StorageUnit);
++}
++
+ static VOID SpdStorageUnitRingProducerWorker(
+     PVOID HwDeviceExtension,
+     PVOID Context,
+@@ -1364,11 +1517,7 @@ static VOID SpdStorageUnitRingProducerWorker(
+                 continue;
+ 
+             /* Keep one lifetime reference across the queued continuation. */
+-            ULONG StorStatus = StorPortQueueWorkItem(
+-                HwDeviceExtension,
+-                SpdStorageUnitRingProducerWorker,
+-                Ring->ProducerWorker,
+-                StorageUnit);
++            ULONG StorStatus = SpdStorageUnitRingQueueProducerWorker(StorageUnit);
+             if (STOR_STATUS_SUCCESS == StorStatus)
+                 return;
+             SpdStorageUnitRingMarkFailed(StorageUnit);
+@@ -1432,11 +1581,7 @@ VOID SpdStorageUnitRingScheduleProducer(SPD_STORAGE_UNIT *StorageUnit)
+             /* Count before queueing so a fast worker cannot release first. */
+             InterlockedIncrement(&Ring->ProducerLiveReferences);
+ #endif
+-            ULONG StorStatus = StorPortQueueWorkItem(
+-                DeviceExtension,
+-                SpdStorageUnitRingProducerWorker,
+-                Ring->ProducerWorker,
+-                StorageUnit);
++            ULONG StorStatus = SpdStorageUnitRingQueueProducerWorker(StorageUnit);
+             if (STOR_STATUS_SUCCESS == StorStatus)
+                 return;
+ 
+@@ -1507,15 +1652,24 @@ SPD_SERVICE_IRP_DISPOSITION SpdStorageUnitRingWait(
+         return SpdServiceIrpCompleteNow;
+     }
+ 
+-    if (0 != InterlockedCompareExchangePointer(
+-            &Ring->WaitIrp, Irp, 0))
++    IoAcquireCancelSpinLock(&Irql);
++    if (0 != Ring->WaitIrp || Irp->Cancel)
+     {
++        NTSTATUS Status = Irp->Cancel ? STATUS_CANCELLED : STATUS_DEVICE_BUSY;
++        IoReleaseCancelSpinLock(Irql);
+         SpdStorageUnitRingLeave(StorageUnit);
+         SpdStorageUnitRingLeave(StorageUnit);
+-        Irp->IoStatus.Status = STATUS_DEVICE_BUSY;
++        Irp->IoStatus.Status = Status;
+         SpdStorageUnitDereference(DeviceExtension, StorageUnit);
+         return SpdServiceIrpCompleteNow;
+     }
++    Irp->Tail.Overlay.DriverContext[0] = StorageUnit;
++    Ring->WaitIrp = Irp;
++    PDRIVER_CANCEL CancelRoutine = IoSetCancelRoutine(
++        Irp, SpdStorageUnitRingCancelWaitIrp);
++    ASSERT(0 == CancelRoutine);
++    UNREFERENCED_PARAMETER(CancelRoutine);
++    IoReleaseCancelSpinLock(Irql);
+ 
+     InterlockedIncrement64(&Ring->WaitSubmissions);
+     SpdStorageUnitRingScheduleProducer(StorageUnit);
+@@ -1532,6 +1686,19 @@ SPD_SERVICE_IRP_DISPOSITION SpdStorageUnitRingWait(
+     return SpdServiceIrpDeferred;
+ }
+ 
++VOID SpdStorageUnitRingTerminalReset(SPD_STORAGE_UNIT *StorageUnit)
++{
++    SPD_RING_STATE *Ring = &StorageUnit->Ring;
++    KIRQL Irql;
++    /* IOQ has already stopped claims and publication under its metadata lock.
++     * Wake transport waiters separately, without nesting the two locks or
++     * waiting for a worker that may currently own a payload copy. */
++    KeAcquireSpinLock(&Ring->Lock, &Irql);
++    Ring->Stopping = TRUE;
++    KeReleaseSpinLock(&Ring->Lock, Irql);
++    SpdStorageUnitRingCancelWait(StorageUnit);
++}
++
+ VOID SpdStorageUnitRingStopForRemoval(SPD_STORAGE_UNIT *StorageUnit)
+ {
+     SPD_RING_STATE *Ring = &StorageUnit->Ring;
+@@ -1651,15 +1818,10 @@ NTSTATUS SpdStorageUnitRingKick(
+             StorageUnit->Ioq, Response->Hint, &SrbExtension);
+         if (!NT_SUCCESS(Result))
+         {
+-            if (SPD_RING_NO_BUFFER != BufferId)
+-            {
+-                KeAcquireSpinLock(&Ring->Lock, &Irql);
+-                if (BufferId < Ring->BufferCount &&
+-                    Ring->Buffers.Meta[BufferId].Allocated &&
+-                    Ring->Buffers.Meta[BufferId].OwnerHint == Response->Hint)
+-                    SpdRingBufferFreeLocked(Ring, BufferId);
+-                KeReleaseSpinLock(&Ring->Lock, Irql);
+-            }
++            /* Failed validation establishes no right to reclaim this buffer.
++             * Keep it quarantined until terminal session rundown. */
++            if (STATUS_CANCELLED == Result)
++                goto exit; /* Expected rejection after terminal reset/STOP. */
+             Failed = TRUE;
+             break;
+         }
+@@ -1674,15 +1836,6 @@ NTSTATUS SpdStorageUnitRingKick(
+             StorageUnit->Ioq, SrbExtension, SrbStatus);
+         if (!NT_SUCCESS(Result))
+         {
+-            if (SPD_RING_NO_BUFFER != BufferId)
+-            {
+-                KeAcquireSpinLock(&Ring->Lock, &Irql);
+-                if (BufferId < Ring->BufferCount &&
+-                    Ring->Buffers.Meta[BufferId].Allocated &&
+-                    Ring->Buffers.Meta[BufferId].OwnerHint == Response->Hint)
+-                    SpdRingBufferFreeLocked(Ring, BufferId);
+-                KeReleaseSpinLock(&Ring->Lock, Irql);
+-            }
+             Failed = TRUE;
+             break;
+         }
+@@ -1896,6 +2049,7 @@ NTSTATUS SpdStorageUnitProvision(
+     Result = SpdIoqCreate(DeviceExtension, &StorageUnit->Ioq);
+     if (!NT_SUCCESS(Result))
+         goto exit;
++    StorageUnit->Ioq->StorageUnit = StorageUnit;
+ 
+     KeAcquireSpinLock(&DeviceExtension->SpinLock, &Irql);
+     DuplicateUnit = 0;
+diff --git a/src/sys/util.c b/src/sys/util.c
+index dc82464..a138175 100644
+--- a/src/sys/util.c
++++ b/src/sys/util.c
+@@ -125,3 +125,29 @@ NTSTATUS SpdGetScsiAddress(
+ 
+     return STATUS_SUCCESS;
+ }
++
++/* Emit after worker rundown. Percentiles are the upper endpoint of the bin,
++ * in QPC ticks; retain the clock frequency so parsers can convert to time. */
++VOID SpdHistogramLog(const SPD_HISTOGRAM *Histogram, PCSTR Name)
++{
++    UINT64 Count = 0, Cumulative = 0, P50 = 0, P99 = 0;
++    LARGE_INTEGER Frequency;
++    for (ULONG I = 0; I < SPD_HISTOGRAM_BUCKETS; I++)
++        Count += Histogram->Bins[I];
++    UINT64 Rank50 = Count / 2 + (Count % 2 != 0);
++    UINT64 Rank99 = Count - Count / 100;
++    for (ULONG I = 0; I < SPD_HISTOGRAM_BUCKETS && 0 != Count; I++)
++    {
++        Cumulative += Histogram->Bins[I];
++        if (0 == P50 && Cumulative >= Rank50)
++            P50 = 1ULL << I;
++        if (Cumulative >= Rank99)
++        {
++            P99 = 1ULL << I;
++            break;
++        }
++    }
++    (void)KeQueryPerformanceCounter(&Frequency);
++    DbgPrint(DRIVER_NAME ": histogram name=%s count=%I64u p50_ticks=%I64u p99_ticks=%I64u qpc_hz=%I64d\n",
++        Name, Count, P50, P99, Frequency.QuadPart);
++}

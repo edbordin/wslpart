@@ -1,0 +1,233 @@
+{
+  "purpose": "correctness stress, not a performance comparison",
+  "runs": [
+    {
+      "run": "mapping-robust-v227-verify256",
+      "driver_hash": "CBED449EBFC2AEA14252AADCA0EC619DBC7950A53A4AF233639B804E7C5B3CE0",
+      "qd": 32,
+      "mapping": {
+        "threshold": 65536,
+        "attempts": 1536,
+        "mapped": 1536,
+        "fallback": 0,
+        "unmapped": 1536,
+        "bytes": 402653184,
+        "map_ticks": 102869,
+        "unmap_ticks": 137276,
+        "mdl_flags": "b1"
+      },
+      "fio": [
+        {
+          "workload": "seqwrite",
+          "read_bytes": 268435456,
+          "write_bytes": 268435456,
+          "options": "--rw=write --bs=1M --iodepth=32 --fsync_on_close=1 --invalidate=1 --verify=crc32c --do_verify=1 --verify_fatal=1 --verify_dump=0"
+        }
+      ],
+      "fully_retired": true
+    },
+    {
+      "run": "mapping-robust-v227-qd32",
+      "driver_hash": "CBED449EBFC2AEA14252AADCA0EC619DBC7950A53A4AF233639B804E7C5B3CE0",
+      "qd": 32,
+      "mapping": {
+        "threshold": 65536,
+        "attempts": 218016,
+        "mapped": 218016,
+        "fallback": 0,
+        "unmapped": 218016,
+        "bytes": 57151586304,
+        "map_ticks": 16133676,
+        "unmap_ticks": 18044336,
+        "mdl_flags": "b1"
+      },
+      "fio": [
+        {
+          "workload": "seqwrite",
+          "read_bytes": 0,
+          "write_bytes": 30589059072,
+          "options": "--rw=write --bs=1M --iodepth=32 --fsync_on_close=1 --invalidate=1 --runtime=15 --time_based=1"
+        },
+        {
+          "workload": "seqread",
+          "read_bytes": 45613056000,
+          "write_bytes": 0,
+          "options": "--rw=read --bs=1M --iodepth=32 --invalidate=1 --runtime=15 --time_based=1"
+        },
+        {
+          "workload": "randread4k",
+          "read_bytes": 4877119488,
+          "write_bytes": 0,
+          "options": "--rw=randread --bs=4k --iodepth=32 --runtime=10 --time_based=1"
+        },
+        {
+          "workload": "randwrite4k",
+          "read_bytes": 0,
+          "write_bytes": 5831380992,
+          "options": "--rw=randwrite --bs=4k --iodepth=32 --runtime=10 --time_based=1 --end_fsync=1"
+        }
+      ],
+      "fully_retired": true
+    },
+    {
+      "run": "mapping-robust-v227-qd64",
+      "driver_hash": "CBED449EBFC2AEA14252AADCA0EC619DBC7950A53A4AF233639B804E7C5B3CE0",
+      "qd": 64,
+      "mapping": {
+        "threshold": 65536,
+        "attempts": 224286,
+        "mapped": 224286,
+        "fallback": 0,
+        "unmapped": 224286,
+        "bytes": 58795229184,
+        "map_ticks": 13753125,
+        "unmap_ticks": 19550378,
+        "mdl_flags": "b1"
+      },
+      "fio": [
+        {
+          "workload": "seqwrite",
+          "read_bytes": 0,
+          "write_bytes": 31190941696,
+          "options": "--rw=write --bs=1M --iodepth=64 --fsync_on_close=1 --invalidate=1 --runtime=15 --time_based=1"
+        },
+        {
+          "workload": "seqread",
+          "read_bytes": 47201648640,
+          "write_bytes": 0,
+          "options": "--rw=read --bs=1M --iodepth=64 --invalidate=1 --runtime=15 --time_based=1"
+        },
+        {
+          "workload": "randread4k",
+          "read_bytes": 6202806272,
+          "write_bytes": 0,
+          "options": "--rw=randread --bs=4k --iodepth=64 --runtime=10 --time_based=1"
+        },
+        {
+          "workload": "randwrite4k",
+          "read_bytes": 0,
+          "write_bytes": 6616281088,
+          "options": "--rw=randwrite --bs=4k --iodepth=64 --runtime=10 --time_based=1 --end_fsync=1"
+        }
+      ],
+      "fully_retired": true
+    },
+    {
+      "run": "mapping-robust-v227-qd128",
+      "driver_hash": "CBED449EBFC2AEA14252AADCA0EC619DBC7950A53A4AF233639B804E7C5B3CE0",
+      "qd": 128,
+      "mapping": {
+        "threshold": 65536,
+        "attempts": 218019,
+        "mapped": 218019,
+        "fallback": 0,
+        "unmapped": 218019,
+        "bytes": 57152372736,
+        "map_ticks": 13436859,
+        "unmap_ticks": 16938975,
+        "mdl_flags": "b1"
+      },
+      "fio": [
+        {
+          "workload": "seqwrite",
+          "read_bytes": 0,
+          "write_bytes": 27216838656,
+          "options": "--rw=write --bs=1M --iodepth=128 --fsync_on_close=1 --invalidate=1 --runtime=15 --time_based=1"
+        },
+        {
+          "workload": "seqread",
+          "read_bytes": 48985276416,
+          "write_bytes": 0,
+          "options": "--rw=read --bs=1M --iodepth=128 --invalidate=1 --runtime=15 --time_based=1"
+        },
+        {
+          "workload": "randread4k",
+          "read_bytes": 6546313216,
+          "write_bytes": 0,
+          "options": "--rw=randread --bs=4k --iodepth=128 --runtime=10 --time_based=1"
+        },
+        {
+          "workload": "randwrite4k",
+          "read_bytes": 0,
+          "write_bytes": 6700306432,
+          "options": "--rw=randwrite --bs=4k --iodepth=128 --runtime=10 --time_based=1 --end_fsync=1"
+        }
+      ],
+      "fully_retired": true
+    },
+    {
+      "run": "mapping-robust-release230-verify256",
+      "driver_hash": "60716EE69CD8E7E0EACA5E4B9BB45F92B06AB55DFFC299CB8BCBFC4D256DAFF9",
+      "qd": 64,
+      "mapping": {
+        "threshold": 65536,
+        "attempts": 1536,
+        "mapped": 1536,
+        "fallback": 0,
+        "unmapped": 1536,
+        "bytes": 402653184,
+        "map_ticks": 93303,
+        "unmap_ticks": 117473,
+        "mdl_flags": "b1"
+      },
+      "fio": [
+        {
+          "workload": "seqwrite",
+          "read_bytes": 268435456,
+          "write_bytes": 268435456,
+          "options": "--rw=write --bs=1M --iodepth=64 --fsync_on_close=1 --invalidate=1 --verify=crc32c --do_verify=1 --verify_fatal=1 --verify_dump=0"
+        }
+      ],
+      "fully_retired": true
+    },
+    {
+      "run": "mapping-robust-release230-qd128",
+      "driver_hash": "60716EE69CD8E7E0EACA5E4B9BB45F92B06AB55DFFC299CB8BCBFC4D256DAFF9",
+      "qd": 128,
+      "mapping": {
+        "threshold": 65536,
+        "attempts": 158919,
+        "mapped": 158919,
+        "fallback": 0,
+        "unmapped": 158919,
+        "bytes": 41659662336,
+        "map_ticks": 9019563,
+        "unmap_ticks": 10788868,
+        "mdl_flags": "b1"
+      },
+      "fio": [
+        {
+          "workload": "seqwrite",
+          "read_bytes": 0,
+          "write_bytes": 24670896128,
+          "options": "--rw=write --bs=1M --iodepth=128 --fsync_on_close=1 --invalidate=1 --runtime=10 --time_based=1"
+        },
+        {
+          "workload": "seqread",
+          "read_bytes": 30875320320,
+          "write_bytes": 0,
+          "options": "--rw=read --bs=1M --iodepth=128 --invalidate=1 --runtime=10 --time_based=1"
+        },
+        {
+          "workload": "randread4k",
+          "read_bytes": 3699662848,
+          "write_bytes": 0,
+          "options": "--rw=randread --bs=4k --iodepth=128 --runtime=5 --time_based=1"
+        },
+        {
+          "workload": "randwrite4k",
+          "read_bytes": 0,
+          "write_bytes": 3904118784,
+          "options": "--rw=randwrite --bs=4k --iodepth=128 --runtime=5 --time_based=1 --end_fsync=1"
+        },
+        {
+          "workload": "fsync4k",
+          "read_bytes": 0,
+          "write_bytes": 14610432,
+          "options": "--rw=write --bs=4k --iodepth=1 --fsync=1 --invalidate=1 --runtime=5 --time_based=1"
+        }
+      ],
+      "fully_retired": true
+    }
+  ]
+}

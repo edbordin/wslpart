@@ -6,6 +6,8 @@ param(
     [UInt64]$ExpectedSize = 52427751424,
     [UInt64]$TestSizeMiB = 256,
     [int]$RandomRuntimeSeconds = 20,
+    [ValidateRange(0, 60)][int]$SequentialRuntimeSeconds = 0,
+    [ValidateRange(1, 256)][int]$FsyncQueueDepth = 1,
     [ValidateRange(1, 256)]
     [int]$QueueDepth = 32,
     [ValidateSet('io_uring', 'libaio', 'sync')]
@@ -37,7 +39,13 @@ param(
     [switch]$IoStats,
     [switch]$ProxyFua,
     [switch]$ProxyFuaUnlocked,
-    [switch]$SkipVhdxBaseline
+    [switch]$SkipVhdxBaseline,
+    [ValidateSet('vhdx-first', 'proxy-first')][string]$StorageOrder = 'vhdx-first',
+    [switch]$TimedFsync,
+    [switch]$VerifySequentialData,
+    [scriptblock]$BeforeProxyShutdown,
+    [scriptblock]$BeforeTimedWorkload,
+    [scriptblock]$AfterTimedWorkload
 )
 
 $ErrorActionPreference = 'Stop'
@@ -73,6 +81,14 @@ public static class WslPartM6Native
     public static extern bool SetEvent(IntPtr handle);
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool CloseHandle(IntPtr handle);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool GetSystemTimes(out ulong idle, out ulong kernel, out ulong user);
+    public static ulong[] ReadCpuTimes() {
+        ulong idle, kernel, user;
+        if (!GetSystemTimes(out idle, out kernel, out user))
+            throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+        return new ulong[] { idle, kernel, user };
+    }
 }
 '@
 }
@@ -123,6 +139,7 @@ if ($SkipVhdxBaseline) {
 $proxyStdout = Join-Path $artifactDir 'proxy.stdout.log'
 $proxyStderr = Join-Path $artifactDir 'proxy.stderr.log'
 $proxyDebugLog = Join-Path $artifactDir 'proxy.events.log'
+$rawFioDir = Join-Path $artifactDir ('fio-raw-' + $(if ($RunTag) { $RunTag } else { [Guid]::NewGuid().ToString('N') }))
 $mountPoint = '/mnt/wslpart-m6-proxy'
 $proxyFile = "$mountPoint/wslpart-m6-$([Guid]::NewGuid().ToString('N')).fio"
 $wslHomeOutput = @(& wsl.exe -d $Distro -- bash -lc 'printf %s "$HOME"' 2>&1)
@@ -214,11 +231,28 @@ function Get-FioClatUs {
     return [math]::Round(([double]$entry.Value / 1000.0), 2)
 }
 
+function Get-FioSyncLatUs {
+    param($Sync, [double]$Percentile)
+    if ($null -eq $Sync -or $null -eq $Sync.lat_ns -or $null -eq $Sync.lat_ns.percentile) { return $null }
+    $key = '{0:F6}' -f $Percentile
+    $entry = $Sync.lat_ns.percentile.PSObject.Properties[$key]
+    if ($null -eq $entry) { return $null }
+    return [math]::Round(([double]$entry.Value / 1000.0), 2)
+}
+
 function Get-FioMeanClatUs {
     param($Direction)
     if ($null -eq $Direction -or $null -eq $Direction.clat_ns -or
         $null -eq $Direction.clat_ns.mean) { return $null }
     return [math]::Round(([double]$Direction.clat_ns.mean / 1000.0), 2)
+}
+
+function Assert-BenchmarkFreeSpace {
+    param([Parameter(Mandatory)][string]$Directory)
+    $available = ((Invoke-WslRoot "df -B1 --output=avail '$Directory' | tail -n 1") -join '').Trim()
+    if ($available -notmatch '^\d+$' -or [UInt64]$available -lt ([UInt64]$TestSizeMiB * 2MB + 1GB)) {
+        throw "Insufficient free space for the unique benchmark file: $Directory (available=$available bytes; required=$([UInt64]$TestSizeMiB * 2MB + 1GB))"
+    }
 }
 
 function Invoke-FioJob {
@@ -251,38 +285,67 @@ function Invoke-FioJob {
     $common = "--name=$($Job.Name) --filename='$File' --size=$size " +
         "--ioengine=$IoEngine --direct=$directFlag --group_reporting=1 " +
         "--output-format=json --output='$jsonPath'"
+    $fioOptions = $Job.Options
+    if ($VerifySequentialData -and $Job.Name -eq 'seqwrite') {
+        $fioOptions += ' --verify=crc32c --do_verify=1 --verify_fatal=1 --verify_dump=0'
+    }
     $command = "mkdir -p '$([string]$File.Substring(0, $File.LastIndexOf('/')))' " +
-        "; if ! timeout --foreground 120s fio $common $($Job.Options); then " +
+        "; if ! timeout --foreground 120s fio $common $fioOptions; then " +
         "echo FIO_FAILED >&2; exit 1; fi"
     if ($Storage -eq 'winspd-partition' -and ($null -eq $process -or $process.HasExited)) {
         $stderr = if (Test-Path -LiteralPath $proxyStderr) { Get-Content -Raw $proxyStderr } else { '' }
         throw "Proxy exited before $($Job.Name) started. $stderr"
     }
+    if ($null -ne $BeforeTimedWorkload) { & $BeforeTimedWorkload $Storage $Job.Name }
     $cpuBefore = Get-ProxyCpuSeconds
+    $systemCpuBefore = [WslPartM6Native]::ReadCpuTimes()
     $started = Get-Date
-    Invoke-WslRoot $command | Out-Null
+    try {
+        Invoke-WslRoot $command | Out-Null
+    }
+    finally {
+        # Read the timed counters before trace finalization or other hooks.
+        $elapsed = ((Get-Date) - $started).TotalSeconds
+        $systemCpuAfter = [WslPartM6Native]::ReadCpuTimes()
+        $cpuAfter = Get-ProxyCpuSeconds
+        if ($null -ne $AfterTimedWorkload) { & $AfterTimedWorkload $Storage $Job.Name }
+    }
     if ($Storage -eq 'winspd-partition' -and ($null -eq $process -or $process.HasExited)) {
         $stderr = if (Test-Path -LiteralPath $proxyStderr) { Get-Content -Raw $proxyStderr } else { '' }
         throw "Proxy exited during $($Job.Name). $stderr"
     }
-    $elapsed = ((Get-Date) - $started).TotalSeconds
+    $cpuKernel = [double]($systemCpuAfter[1] - $systemCpuBefore[1])
+    $cpuUser = [double]($systemCpuAfter[2] - $systemCpuBefore[2])
+    $cpuIdle = [double]($systemCpuAfter[0] - $systemCpuBefore[0])
+    $cpuTotal = $cpuKernel + $cpuUser
     $json = (Invoke-WslRoot "cat '$jsonPath'; rm -f '$jsonPath'") -join "`n"
     $data = $json | ConvertFrom-Json
     $jobData = $data.jobs[0]
-    $cpuAfter = Get-ProxyCpuSeconds
+    if ($data.jobs.Count -ne 1 -or $jobData.error -ne 0) {
+        throw "Unexpected fio job count or failed job: $Storage/$($Job.Name)"
+    }
+    $null = New-Item -ItemType Directory -Force -Path $rawFioDir
+    $rawFioPath = Join-Path $rawFioDir "$Storage-$($Job.Name).json"
+    $json | Set-Content -LiteralPath $rawFioPath -Encoding UTF8
     $read = $jobData.read
     $write = $jobData.write
     $actualQueueDepth = 0.0
+    $depthHistogramPercent = 0.0
     foreach ($depthProperty in $jobData.iodepth_level.PSObject.Properties) {
         if ($depthProperty.Name -match '^\d+$') {
+            $depthHistogramPercent += [double]$depthProperty.Value
             $actualQueueDepth += [double]$depthProperty.Name *
                 ([double]$depthProperty.Value / 100.0)
         }
         elseif ($depthProperty.Name -match '^>=(\d+)$') {
+            $depthHistogramPercent += [double]$depthProperty.Value
             $actualQueueDepth += [double]$Matches[1] *
                 ([double]$depthProperty.Value / 100.0)
         }
     }
+    # fio can count sync operations in depth samples but normalize by write I/Os,
+    # yielding 200% for QD1 write+fsync. Normalize the observed sample weights.
+    if ($depthHistogramPercent -gt 0) { $actualQueueDepth *= 100.0 / $depthHistogramPercent }
     $fioRuntimeMs = [math]::Max([double]$read.runtime, [double]$write.runtime)
     [pscustomobject]@{
         Storage = $Storage
@@ -299,11 +362,24 @@ function Invoke-FioJob {
         ProxyCpuPercent = if ($elapsed -gt 0) {
             [math]::Round((($cpuAfter - $cpuBefore) / $elapsed) * 100, 2)
         } else { 0 }
-        FioOptions = $Job.Options
+        WindowsCpuPercent = if ($cpuTotal -gt 0) { [math]::Round(100 * (1 - $cpuIdle / $cpuTotal), 2) } else { $null }
+        WindowsKernelCpuPercent = if ($cpuTotal -gt 0) { [math]::Round(100 * ($cpuKernel - $cpuIdle) / $cpuTotal, 2) } else { $null }
+        WindowsUserCpuPercent = if ($cpuTotal -gt 0) { [math]::Round(100 * $cpuUser / $cpuTotal, 2) } else { $null }
+        FioUserCpuPercent = $jobData.usr_cpu
+        FioSystemCpuPercent = $jobData.sys_cpu
+        SyncCalls = $jobData.sync.total_ios
+        SyncLatMeanUs = if ($null -ne $jobData.sync.lat_ns.mean) { [math]::Round([double]$jobData.sync.lat_ns.mean / 1000, 2) } else { $null }
+        SyncLatP50Us = Get-FioSyncLatUs $jobData.sync 50.0
+        SyncLatP95Us = Get-FioSyncLatUs $jobData.sync 95.0
+        SyncLatP99Us = Get-FioSyncLatUs $jobData.sync 99.0
+        SyncLatP999Us = Get-FioSyncLatUs $jobData.sync 99.9
+        FioOptions = $fioOptions
         FioIoEngine = $IoEngine
-        RequestedQueueDepth = $QueueDepth
+        RequestedQueueDepth = if ($Job.ContainsKey('QueueDepth')) { $Job.QueueDepth } else { $QueueDepth }
+        RawFioJson = $rawFioPath
         AverageQueueDepthLowerBound = [math]::Round($actualQueueDepth, 2)
         FioQueueDepthHistogram = $jobData.iodepth_level
+        FioQueueDepthHistogramTotalPercent = $depthHistogramPercent
         ReadClatP50Us = Get-FioClatUs $read 50.0
         ReadClatP95Us = Get-FioClatUs $read 95.0
         ReadClatP99Us = Get-FioClatUs $read 99.0
@@ -326,37 +402,46 @@ function Invoke-FioJob {
 
 $randReadInvalidate = if ('cold' -eq $ReadCacheMode) { ' --invalidate=1' } else { '' }
 $randWriteEndFsync = if ($OmitRandomWriteEndFsync) { '' } else { ' --end_fsync=1' }
+$seqRuntime = if ($SequentialRuntimeSeconds -gt 0) { " --runtime=$SequentialRuntimeSeconds --time_based=1" } else { '' }
+$fsyncOptions = if ($TimedFsync) {
+    "--rw=write --bs=4k --iodepth=$FsyncQueueDepth --fsync=1 --invalidate=1 --runtime=$RandomRuntimeSeconds --time_based=1"
+} else { '--rw=write --bs=4k --iodepth=1 --fsync=1 --invalidate=1' }
 $jobs = @(
-    @{ Name = 'seqwrite'; Options = '--rw=write --bs=1M --iodepth=1 --fsync_on_close=1 --invalidate=1' },
-    @{ Name = 'seqread'; Options = '--rw=read --bs=1M --iodepth=1 --invalidate=1' },
+    @{ Name = 'seqwrite'; Options = "--rw=write --bs=1M --iodepth=$QueueDepth --fsync_on_close=1 --invalidate=1$seqRuntime" },
+    @{ Name = 'seqread'; Options = "--rw=read --bs=1M --iodepth=$QueueDepth --invalidate=1$seqRuntime" },
     @{ Name = 'randread4k'; Options = "--rw=randread --bs=4k --iodepth=$QueueDepth --runtime=$RandomRuntimeSeconds --time_based=1$randReadInvalidate" },
     @{ Name = 'randwrite4k'; Options = "--rw=randwrite --bs=4k --iodepth=$QueueDepth --runtime=$RandomRuntimeSeconds --time_based=1$randWriteEndFsync" },
-    @{ Name = 'fsync4k'; SizeMiB = 16; Options = '--rw=write --bs=4k --iodepth=1 --fsync=1 --invalidate=1' }
+    @{ Name = 'fsync4k'; SizeMiB = 16; QueueDepth = $(if ($TimedFsync) { $FsyncQueueDepth } else { 1 }); Options = $fsyncOptions }
 )
 $jobs = @($jobs | Where-Object { $Workloads -contains $_.Name })
 if (0 -eq $jobs.Count) { throw 'No benchmark workloads were selected.' }
 
+function Invoke-VhdxBenchmarks {
+    # Keep the baseline on the distro's ext4 filesystem (the VHDX), not
+    # /tmp, which WSL commonly mounts as tmpfs. Use a unique path and never
+    # delete a pre-existing test directory.
+    Invoke-WslRoot "mkdir -m 700 '$vhdxRoot'"
+    Assert-BenchmarkFreeSpace $vhdxRoot
+    if (($Workloads -contains 'randread4k' -or
+        $Workloads -contains 'randwrite4k') -and
+        -not ($Workloads -contains 'seqwrite')) {
+        $prepareFlag = if ($DirectIO) { 1 } else { 0 }
+        $prepare = "fio --name=vhdx-prepare --filename='$vhdxFile' " +
+            "--size=${TestSizeMiB}M --ioengine=$IoEngine --direct=$prepareFlag " +
+            '--rw=write --bs=1M --iodepth=8 --end_fsync=1 --group_reporting=1'
+        Invoke-WslRoot "if ! $prepare >/dev/null; then echo VHDX_PREPARE_FAILED >&2; exit 1; fi"
+    }
+    foreach ($job in $jobs) {
+        Invoke-FioJob -Storage 'wsl-vhdx' -File $vhdxFile -Job $job -Class 'baseline'
+    }
+    Invoke-WslRoot "sync; rm -rf '$vhdxRoot'"
+}
+
 try {
     if (-not (Test-Path -LiteralPath $proxyExe)) { throw "Proxy binary not found: $proxyExe" }
 
-    if (-not $SkipVhdxBaseline) {
-        # Keep the baseline on the distro's ext4 filesystem (the VHDX), not
-        # /tmp, which WSL commonly mounts as tmpfs. Use a unique path and never
-        # delete a pre-existing test directory.
-        Invoke-WslRoot "mkdir -m 700 '$vhdxRoot'"
-        if (($Workloads -contains 'randread4k' -or
-            $Workloads -contains 'randwrite4k') -and
-            -not ($Workloads -contains 'seqwrite')) {
-            $prepareFlag = if ($DirectIO) { 1 } else { 0 }
-            $prepare = "fio --name=vhdx-prepare --filename='$vhdxFile' " +
-                "--size=${TestSizeMiB}M --ioengine=$IoEngine --direct=$prepareFlag " +
-                '--rw=write --bs=1M --iodepth=8 --end_fsync=1 --group_reporting=1'
-            Invoke-WslRoot "if ! $prepare >/dev/null; then echo VHDX_PREPARE_FAILED >&2; exit 1; fi"
-        }
-        foreach ($job in $jobs) {
-            $allResults += Invoke-FioJob -Storage 'wsl-vhdx' -File $vhdxFile -Job $job -Class 'baseline'
-        }
-        Invoke-WslRoot "sync; rm -rf '$vhdxRoot'"
+    if (-not $SkipVhdxBaseline -and $StorageOrder -eq 'vhdx-first') {
+        $allResults += Invoke-VhdxBenchmarks
     }
 
     # Proxy: the selected physical partition through WinSpd.
@@ -399,6 +484,7 @@ try {
     if ($proxyFileAbsent.Trim() -ne 'ABSENT') {
         throw "Unique proxy benchmark file unexpectedly exists: $proxyFile"
     }
+    Assert-BenchmarkFreeSpace $mountPoint
     if (($Workloads -contains 'randread4k' -or
         $Workloads -contains 'randwrite4k') -and
         -not ($Workloads -contains 'seqwrite')) {
@@ -416,10 +502,15 @@ try {
     & wsl.exe --unmount $physicalDrive
     if ($LASTEXITCODE -ne 0) { throw 'wsl --unmount failed for proxy.' }
     $attached = $false
+    if ($null -ne $BeforeProxyShutdown) { & $BeforeProxyShutdown }
     Signal-ProxyShutdown
     if (-not $process.WaitForExit(30000)) { throw 'Proxy did not shut down gracefully.' }
     $process.Refresh()
     if ([int]$process.ExitCode -ne 0) { throw "Proxy exit code: $($process.ExitCode)" }
+
+    if (-not $SkipVhdxBaseline -and $StorageOrder -eq 'proxy-first') {
+        $allResults += Invoke-VhdxBenchmarks
+    }
 
     $ringStats = $null
     if ($ProxyTransport -eq 'shared-ring' -and
@@ -451,8 +542,19 @@ try {
         }
     }
 
+    $taskDriverInfo = (Get-Item -LiteralPath "$env:SystemRoot\System32\drivers\winspd-arm64.sys").VersionInfo
+    $proxyDllPath = Join-Path (Split-Path $proxyExe) 'winspd-ARM64.dll'
+    $proxyDllImageHash = & python (Join-Path $PSScriptRoot 'hash-winspd-pe-image.py') $proxyDllPath
+    if ($LASTEXITCODE -ne 0) { throw 'Could not verify the userspace transport image.' }
     $report = [pscustomobject]@{
         GeneratedAt = (Get-Date).ToString('o')
+        InstalledDriverHash = (Get-FileHash -LiteralPath "$env:SystemRoot\System32\drivers\winspd-arm64.sys").Hash
+        InstalledDriverVersion = (Get-Item -LiteralPath "$env:SystemRoot\System32\drivers\winspd-arm64.sys").VersionInfo.FileVersion
+        InstalledDriverNumericVersion = '{0}.{1}.{2}.{3}' -f $taskDriverInfo.FileMajorPart, $taskDriverInfo.FileMinorPart, $taskDriverInfo.FileBuildPart, $taskDriverInfo.FilePrivatePart
+        ProxyHash = (Get-FileHash -LiteralPath $proxyExe).Hash
+        ProxyDllHash = (Get-FileHash -LiteralPath $proxyDllPath).Hash
+        ProxyDllImageHash = $proxyDllImageHash
+        TimedFsync = [bool]$TimedFsync
         WindowsVersion = [Environment]::OSVersion.VersionString
         WslDistro = $Distro
         FioVersion = ((Invoke-WslRoot 'fio --version') -join ' ').Trim()
@@ -461,10 +563,14 @@ try {
         PartitionSizeBytes = $ExpectedSize
         TestSizeMiB = $TestSizeMiB
         RandomRuntimeSeconds = $RandomRuntimeSeconds
+        SequentialRuntimeSeconds = $SequentialRuntimeSeconds
+        VerifySequentialData = [bool]$VerifySequentialData
+        FsyncQueueDepth = if ($TimedFsync) { $FsyncQueueDepth } else { 1 }
         FioIoEngine = $IoEngine
         RequestedQueueDepth = $QueueDepth
         ReadCacheMode = if ($DirectIO) { 'bypassed-by-direct-io' } else { $ReadCacheMode }
         VhdxBaselineIncluded = -not [bool]$SkipVhdxBaseline
+        StorageOrder = $StorageOrder
         DirectIO = [bool]$DirectIO
         ProxySyncPolicy = $ProxySyncPolicy
         ProxyBuffering = $ProxyBuffering

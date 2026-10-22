@@ -55,6 +55,13 @@ typedef struct wslpart_source {
     volatile LONG64 io_stats_slow[2];
     volatile LONG64 io_stats_buckets[2][5];
     volatile LONG64 io_stats_max_us[2];
+    volatile LONG64 io_stats_total_us[2];
+    volatile LONG64 io_stats_exact_buckets[2][64];
+    volatile LONG64 io_stats_flush_calls;
+    volatile LONG64 io_stats_flush_errors;
+    volatile LONG64 io_stats_flush_total_us;
+    volatile LONG64 io_stats_flush_max_us;
+    volatile LONG64 io_stats_flush_buckets[64];
     volatile LONG64 io_stats_response_slow;
     volatile LONG64 io_stats_response_max_us;
     volatile LONG io_stats_pending_max;
@@ -394,6 +401,53 @@ static void record_io_latency(WSLPART_SOURCE *source,
         elapsed_us < 100000 ? 2 : elapsed_us < 1000000 ? 3 : 4;
     InterlockedIncrement64(&source->io_stats_buckets[type][bucket]);
     update_max64(&source->io_stats_max_us[type], (LONG64)elapsed_us);
+    InterlockedExchangeAdd64(&source->io_stats_total_us[type], (LONG64)elapsed_us);
+    UINT64 value = elapsed_us;
+    UINT32 exact_bucket = 0;
+    while (value > 1 && exact_bucket < 63)
+    {
+        value = (value >> 1) + (value & 1);
+        exact_bucket++;
+    }
+    InterlockedIncrement64(&source->io_stats_exact_buckets[type][exact_bucket]);
+}
+
+static void record_flush_latency(WSLPART_SOURCE *source,
+    LARGE_INTEGER started, BOOL ok)
+{
+    LARGE_INTEGER now;
+    UINT64 elapsed_us, value;
+    UINT32 bucket = 0;
+    if (!source->io_stats || 0 == started.QuadPart || !QueryPerformanceCounter(&now))
+        return;
+    elapsed_us = ((UINT64)(now.QuadPart - started.QuadPart) * 1000000ULL) /
+        (UINT64)source->io_stats_frequency.QuadPart;
+    value = elapsed_us;
+    while (value > 1 && bucket < 63)
+    {
+        value = (value >> 1) + (value & 1);
+        bucket++;
+    }
+    InterlockedIncrement64(&source->io_stats_flush_calls);
+    if (!ok)
+        InterlockedIncrement64(&source->io_stats_flush_errors);
+    InterlockedExchangeAdd64(&source->io_stats_flush_total_us, (LONG64)elapsed_us);
+    InterlockedIncrement64(&source->io_stats_flush_buckets[bucket]);
+    update_max64(&source->io_stats_flush_max_us, (LONG64)elapsed_us);
+}
+
+static UINT64 io_latency_percentile(volatile LONG64 *buckets, UINT64 rank)
+{
+    UINT64 count = 0;
+    if (0 == rank)
+        return 0;
+    for (UINT32 i = 0; i < 64; i++)
+    {
+        count += (UINT64)read_counter64(&buckets[i]);
+        if (count >= rank)
+            return 1ULL << i;
+    }
+    return 0;
 }
 
 static void log_io_stats(WSLPART_SOURCE *source)
@@ -420,9 +474,25 @@ static void log_io_stats(WSLPART_SOURCE *source)
             read_counter64(&source->io_stats_buckets[type][4]),
             read_counter64(&source->io_stats_slow[type]),
             read_counter64(&source->io_stats_max_us[type]));
+    for (UINT32 type = 0; type < 2; type++)
+    {
+        UINT64 count = (UINT64)read_counter64(&source->io_stats_completed[type]);
+        SpdDebugLog("wslpart io-stats backend-io kind=%s calls=%I64u total-us=%I64d max-us=%I64d p50-upper-us=%I64u p99-upper-us=%I64u\n",
+            0 == type ? "read" : "write", count,
+            read_counter64(&source->io_stats_total_us[type]), read_counter64(&source->io_stats_max_us[type]),
+            io_latency_percentile(source->io_stats_exact_buckets[type], count / 2 + (count % 2 != 0)),
+            io_latency_percentile(source->io_stats_exact_buckets[type], count - count / 100));
+    }
     SpdDebugLog("wslpart io-stats response-post slow>=1ms:%I64d max-us:%I64d\n",
         read_counter64(&source->io_stats_response_slow),
         read_counter64(&source->io_stats_response_max_us));
+    UINT64 flush_calls = (UINT64)read_counter64(&source->io_stats_flush_calls);
+    SpdDebugLog("wslpart io-stats backend-flush calls=%I64u errors=%I64d total-us=%I64d max-us=%I64d p50-upper-us=%I64u p99-upper-us=%I64u\n",
+        flush_calls, read_counter64(&source->io_stats_flush_errors),
+        read_counter64(&source->io_stats_flush_total_us),
+        read_counter64(&source->io_stats_flush_max_us),
+        io_latency_percentile(source->io_stats_flush_buckets, flush_calls / 2 + (flush_calls % 2 != 0)),
+        io_latency_percentile(source->io_stats_flush_buckets, flush_calls - flush_calls / 100));
 }
 
 static VOID complete_source_async(
@@ -823,19 +893,26 @@ static BOOL flush_backing_store(WSLPART_SOURCE *source, DWORD *error)
     BOOL ok;
     BOOL fua_ok = TRUE;
     DWORD first_error = ERROR_SUCCESS;
+    LARGE_INTEGER started = { 0 };
 
     AcquireSRWLockExclusive(&source->flush_lock);
     close_source_write_gate(source);
     if (!source->overlapped)
         AcquireSRWLockExclusive(&source->io_lock);
+    if (source->io_stats)
+        QueryPerformanceCounter(&started);
     ok = FlushFileBuffers(source->handle);
     if (!ok)
         first_error = GetLastError();
+    record_flush_latency(source, started, ok);
     if (INVALID_HANDLE_VALUE != source->fua_handle)
     {
+        if (source->io_stats)
+            QueryPerformanceCounter(&started);
         fua_ok = FlushFileBuffers(source->fua_handle);
         if (!fua_ok && ERROR_SUCCESS == first_error)
             first_error = GetLastError();
+        record_flush_latency(source, started, fua_ok);
     }
     if (!source->overlapped)
         ReleaseSRWLockExclusive(&source->io_lock);
